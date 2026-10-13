@@ -20,6 +20,8 @@ package flauto
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -31,8 +33,11 @@ import (
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
 
+// TokenFunc returns the orchestrator's service-account access token; the
+// session gateway's REST API accepts only that token, over TLS.
+type TokenFunc func() (string, error)
+
 const (
-	flServerPort = 12345
 	pollInterval = 5 * time.Second
 	maxWait      = 2 * time.Hour // give up after 2h of not everyone connecting
 )
@@ -44,6 +49,9 @@ type submissionState struct {
 	expectedProviderCount int
 	ownerIP               string
 	tokens                map[string]struct{}
+	gatewayCA             *x509.CertPool // the session gateway's CA (gov_layer's governance CA)
+	gatewayCAPEM          string
+	ownerReady            chan struct{}  // closed once ownerIP is set
 	lastConnectedCount    int
 	started               bool
 	polling               bool
@@ -52,19 +60,79 @@ type submissionState struct {
 
 // Manager tracks FL auto-start state per submission.
 type Manager struct {
-	store *vmsession.Store
-	http  *http.Client
+	store    *vmsession.Store
+	token    TokenFunc
+	restPort int
 
 	mu          sync.Mutex
 	submissions map[string]*submissionState
 }
 
-func NewManager(store *vmsession.Store) *Manager {
+func NewManager(store *vmsession.Store, token TokenFunc, restPort int) *Manager {
 	return &Manager{
 		store:       store,
-		http:        &http.Client{Timeout: 5 * time.Second},
+		token:       token,
+		restPort:    restPort,
 		submissions: make(map[string]*submissionState),
 	}
+}
+
+// client returns an HTTPS client that trusts only this session gateway's CA.
+// The gateway certificate names the server VM's IP, so the URL uses the IP.
+func (m *Manager) client(s *submissionState, timeout time.Duration) *http.Client {
+	s.mu.Lock()
+	pool := s.gatewayCA
+	s.mu.Unlock()
+	return &http.Client{Timeout: timeout, Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+	}}
+}
+
+// gatewayRequest builds an authenticated request to the session gateway.
+func (m *Manager) gatewayRequest(method, url string, body []byte) (*http.Request, error) {
+	tok, err := m.token()
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
+}
+
+// SetGatewayCA records the CA the session gateway's certificate chains to
+// (from gov_layer's /gateway-certs response); flauto will not talk to the
+// gateway before it is set.
+func (m *Manager) SetGatewayCA(submissionID, caPEM string) error {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(caPEM)) {
+		return fmt.Errorf("invalid gateway CA PEM")
+	}
+	s := m.getOrCreate(submissionID)
+	s.mu.Lock()
+	s.gatewayCA, s.gatewayCAPEM = pool, caPEM
+	s.mu.Unlock()
+	return nil
+}
+
+// WaitOwnerIP blocks until this submission's server VM is up (its gateway
+// secured) and returns its IP — so each client VM is pointed at its OWN
+// session's gateway, not "the latest output-owner VM" overall.
+func (m *Manager) WaitOwnerIP(submissionID string, timeout time.Duration) (string, string, error) {
+	s := m.getOrCreate(submissionID)
+	select {
+	case <-s.ownerReady:
+	case <-time.After(timeout):
+		return "", "", fmt.Errorf("server VM for submission %s not ready after %s", submissionID, timeout)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ownerIP, s.gatewayCAPEM, nil
 }
 
 func (m *Manager) getOrCreate(submissionID string) *submissionState {
@@ -74,6 +142,7 @@ func (m *Manager) getOrCreate(submissionID string) *submissionState {
 	if !ok {
 		s = &submissionState{
 			tokens:             make(map[string]struct{}),
+			ownerReady:         make(chan struct{}),
 			lastConnectedCount: -1,
 		}
 		m.submissions[submissionID] = s
@@ -127,11 +196,15 @@ func (m *Manager) RegisterOwnerVM(submissionID, ip, token string) {
 	}
 	s := m.getOrCreate(submissionID)
 	s.mu.Lock()
+	first := s.ownerIP == ""
 	s.ownerIP = ip
 	if token != "" {
 		s.tokens[token] = struct{}{}
 	}
 	s.mu.Unlock()
+	if first {
+		close(s.ownerReady)
+	}
 	m.maybeStartPolling(submissionID, s)
 }
 
@@ -182,7 +255,7 @@ func (m *Manager) pollOnce(submissionID string, s *submissionState) bool {
 	lastCount := s.lastConnectedCount
 	s.mu.Unlock()
 
-	count, err := m.clientCount(ownerIP)
+	count, err := m.clientCount(s, ownerIP)
 	if err != nil {
 		// server VM likely still booting/pulling images - not worth surfacing every 5s
 		return false
@@ -205,11 +278,18 @@ func (m *Manager) pollOnce(submissionID string, s *submissionState) bool {
 	return false
 }
 
-func (m *Manager) clientCount(ownerIP string) (int, error) {
-	url := fmt.Sprintf("http://%s:%d/client_status", ownerIP, flServerPort)
-	resp, err := m.http.Get(url)
+func (m *Manager) clientCount(s *submissionState, ownerIP string) (int, error) {
+	req, err := m.gatewayRequest(http.MethodGet, fmt.Sprintf("https://%s:%d/client_status", ownerIP, m.restPort), nil)
 	if err != nil {
 		return 0, err
+	}
+	resp, err := m.client(s, 10*time.Second).Do(req)
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return 0, fmt.Errorf("gateway returned %d", resp.StatusCode)
 	}
 	defer resp.Body.Close()
 	var body struct {
@@ -244,9 +324,13 @@ func (m *Manager) startSession(submissionID string, s *submissionState) {
 	// becomes one more event for whoever's still watching this submission's
 	// panels.
 	go func() {
-		url := fmt.Sprintf("http://%s:%d/execute_command", ownerIP, flServerPort)
-		client := &http.Client{} // no timeout — mirrors the Node version's timeout: 0
-		resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
+		req, err := m.gatewayRequest(http.MethodPost, fmt.Sprintf("https://%s:%d/execute_command", ownerIP, m.restPort), payload)
+		if err != nil {
+			m.emit(s, "FL session", "error", err.Error())
+			return
+		}
+		// no timeout — mirrors the Node version's timeout: 0
+		resp, err := m.client(s, 0).Do(req)
 		if err != nil {
 			m.emit(s, "FL session", "error", err.Error())
 			return

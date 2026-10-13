@@ -1,14 +1,25 @@
 #!/bin/bash
 # Rendered by null_resource.wait_for_combine_fl and run over SSH on the VM
 # itself right after it's created. Installs Docker, pulls the pre-built
-# flotilla images from GHCR, and starts the right one for `role`.
+# flotilla images from GHCR, and prepares the right stack for `role`.
+#
+# Flotilla join gateway: nothing here receives a secret. The server VM's
+# gateway key + CSR are generated ON the VM; the orchestrator then (over SSH,
+# after `terraform apply`) gets the certificate signed by gov_layer, writes it
+# with the authorized-parties list and starts the gateway. On a client VM it
+# writes the sidecar config + the provider's VM credential and starts the
+# client + sidecar. See p3dx-fl-orchestrator/internal/postapply.
 #
 # Lines prefixed STAGE:/WARNING: are what vmAutoProvision.service.js's
 # remoteStageLineRe regex picks out of Terraform's "(remote-exec): ..."
 # output and surfaces as individual events in the VM-provisioning UI.
 set -euo pipefail
 
-FLOTILLA_DIR="/home/${admin_username}/flotilla"
+FLOTILLA_DIR="${flotilla_dir != "" ? flotilla_dir : "/home/${admin_username}/flotilla"}"
+GATEWAY_DIR="${gateway_dir}"
+SIDECAR_DIR="${sidecar_dir}"
+GATEWAY_IMAGE="${gateway_image}"
+GATEWAY_UID=10001
 
 echo "STAGE: Installing Docker"
 if ! command -v docker >/dev/null 2>&1; then
@@ -24,69 +35,67 @@ else
   echo "STAGE: Skipping ghcr.io login (no token provided, using public images)"
 fi
 
+# Pull an image unless it is already on the VM (lets a pre-loaded image be used).
+ensure_image() {
+  if ! sudo docker image inspect "$1" >/dev/null 2>&1; then
+    sudo docker pull "$1"
+  fi
+}
+
 mkdir -p "$FLOTILLA_DIR"
 cd "$FLOTILLA_DIR"
 
 echo "STAGE: Writing generate_dataset.py"
 printf '%s' "${generate_dataset_b64}" | base64 -d > generate_dataset.py
 
-%{ if role == "user" ~}
-echo "STAGE: Pulling flotilla-server and flotilla-session images"
-sudo docker pull ghcr.io/${ghcr_namespace}/flotilla-server:${image_tag}
-sudo docker tag ghcr.io/${ghcr_namespace}/flotilla-server:${image_tag} flotilla-server:${image_tag}
-sudo docker pull ghcr.io/${ghcr_namespace}/flotilla-session:latest
-sudo docker tag ghcr.io/${ghcr_namespace}/flotilla-session:latest flotilla-session:latest
+echo "STAGE: Pulling the Flotilla gateway image"
+ensure_image "$GATEWAY_IMAGE"
 
-echo "STAGE: Generating validation dataset partition"
-mkdir -p src/val_data src/data
-sudo docker run --rm \
-  -v "$FLOTILLA_DIR/src/val_data:/valdata" \
-  -v "$FLOTILLA_DIR/src/data:/data" \
-  -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
-  flotilla-server:${image_tag} python /generate_dataset.py
+%{ if role == "user" ~}
+echo "STAGE: Pulling flotilla-server image"
+ensure_image ghcr.io/${ghcr_namespace}/flotilla-server:${image_tag}
+sudo docker tag ghcr.io/${ghcr_namespace}/flotilla-server:${image_tag} flotilla-server:${image_tag}
+
+VAL_DATA_DIR="${val_data_dir != "" ? val_data_dir : "$FLOTILLA_DIR/src/val_data"}"
+if [ -z "$(ls -A "$VAL_DATA_DIR" 2>/dev/null)" ]; then
+  echo "STAGE: Generating validation dataset partition"
+  mkdir -p "$VAL_DATA_DIR" src/data
+  sudo docker run --rm \
+    -v "$VAL_DATA_DIR:/valdata" \
+    -v "$FLOTILLA_DIR/src/data:/data" \
+    -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
+    flotilla-server:${image_tag} python /generate_dataset.py
+else
+  echo "STAGE: Using existing validation data in $VAL_DATA_DIR"
+fi
 
 echo "STAGE: Writing server deployment config"
 mkdir -p deployment/checkpoints deployment/server_logs
-printf '%s' "${mosquitto_conf_b64}" | base64 -d > deployment/mosquitto.conf
-# Runtime-only compose file (no `build:` section) - the image is already
-# pulled+tagged above, so this never needs Flotilla_Deployment's source tree.
-cat > deployment/docker-compose.yaml <<'COMPOSE'
+# Runtime-only compose file (no `build:` section). Only the gateway publishes
+# ports: 50051 (client joins, TLS + token) and 12345 (orchestrator REST,
+# TLS + service token). flotilla-server and redis sit on an internal-only
+# network; the relay ports and the plain REST port bind to the gateway's
+# internal address only.
+cat > deployment/docker-compose.yaml <<COMPOSE
 services:
   redis:
     image: redis:7
-    container_name: flotilla-redis
+    container_name: flotilla-gw-redis
     command: redis-server --save 86400 1
-    networks: [flotilla-net]
-    restart: unless-stopped
-
-  mosquitto:
-    image: eclipse-mosquitto:2
-    container_name: flotilla-mqtt
-    networks: [flotilla-net]
-    ports:
-      - "1883:1883"
-      - "9001:9001"
-    volumes:
-      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - mosquitto-data:/mosquitto/data
-      - mosquitto-log:/mosquitto/log
+    networks: [internal]
     restart: unless-stopped
 
   server:
     image: flotilla-server:${image_tag}
-    container_name: flotilla-server
-    depends_on: [redis, mosquitto]
-    networks: [flotilla-net]
-    ports:
-      - "12345:12345"
-      - "50051:50051"
+    container_name: flotilla-gw-server
+    depends_on: [redis]
+    networks: [internal]
     environment:
-      DISCOVERY_TYPE: "${discovery_type}"
+      DISCOVERY_TYPE: "grpc"
       STATE_LOCATION: redis
       STATE_HOSTNAME: redis
       STATE_PORT: "6379"
-      MQTT_BROKER_HOST: mosquitto
-      MQTT_BROKER_PORT: "1883"
+      MQTT_BROKER_HOST: "none"
       GRPC_DISCOVERY_PORT: "50051"
       GRPC_TIMEOUT_S: "1200000"
       REST_HOST: "0.0.0.0"
@@ -97,51 +106,122 @@ services:
       MONITOR: "false"
     volumes:
       - ./server_logs:/src/logs
-      - ../src/val_data:/src/val_data
+      - $VAL_DATA_DIR:/src/val_data
       - ./checkpoints:/src/checkpoint
-      - ../models:/models
+      # No models/ mount: the model code is baked into the server image
+      # (/models); mounting an empty directory there would hide it.
+    restart: unless-stopped
+
+  gateway:
+    image: $GATEWAY_IMAGE
+    container_name: flotilla-gateway
+    depends_on: [server, redis]
+    networks:
+      internal: {ipv4_address: ${gateway_internal_ip}}
+      edge: {}
+    ports:
+      - "50051:50051"
+      - "12345:12345"
+    environment:
+      GATEWAY_MODE: server
+      KEYCLOAK_ISSUER: "${keycloak_issuer}"
+      KEYCLOAK_JWKS_URL: "${keycloak_jwks_url != "" ? keycloak_jwks_url : "${keycloak_issuer}/protocol/openid-connect/certs"}"
+      UPSTREAM_GRPC: flotilla-gw-server:50051
+      UPSTREAM_REST: http://flotilla-gw-server:12345
+      RELAY_ADVERTISE_HOST: flotilla-gateway
+      RELAY_LISTEN_HOST: ${gateway_internal_ip}
+      REST_INTERNAL_HOST: ${gateway_internal_ip}
+      REDIS_URL: redis://flotilla-gw-redis:6379/1
+    volumes:
+      - $GATEWAY_DIR:/etc/flotilla-gateway:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys; sys.exit(0 if os.path.exists('/tmp/gateway-ready') else 1)"]
+      interval: 5s
     restart: unless-stopped
 
 networks:
-  flotilla-net:
-    name: flotilla-network
-
-volumes:
-  mosquitto-data:
-  mosquitto-log:
+  internal:
+    name: flotilla-gw-internal
+    internal: true
+    ipam: {config: [{subnet: ${gateway_internal_subnet}}]}
+  edge:
+    name: flotilla-gw-edge
 COMPOSE
 
-echo "STAGE: Starting flotilla-server stack (server + redis + mosquitto)"
+echo "STAGE: Generating the gateway key and certificate request on this VM"
+sudo mkdir -p "$GATEWAY_DIR"
+sudo chown "$GATEWAY_UID:$GATEWAY_UID" "$GATEWAY_DIR"
+sudo chmod 0750 "$GATEWAY_DIR"
+sudo docker run --rm -e GATEWAY_MODE=gen-csr -e GATEWAY_PUBLIC_IP=${self_ip} \
+  -v "$GATEWAY_DIR:/etc/flotilla-gateway" "$GATEWAY_IMAGE"
+
+echo "STAGE: Starting flotilla-server (gateway starts once its certificate is issued)"
 cd deployment
-sudo docker compose -f docker-compose.yaml up -d --no-build
+sudo docker compose -f docker-compose.yaml up -d --no-build redis server
 echo "STAGE: flotilla-server started"
 
 %{ else ~}
 echo "STAGE: Pulling flotilla-client image"
-sudo docker pull ghcr.io/${ghcr_namespace}/flotilla-client:${image_tag}
+ensure_image ghcr.io/${ghcr_namespace}/flotilla-client:${image_tag}
 sudo docker tag ghcr.io/${ghcr_namespace}/flotilla-client:${image_tag} flotilla-client:${image_tag}
 
-echo "STAGE: Generating client dataset partition"
-mkdir -p src/data src/val_data
-sudo docker run --rm \
-  -v "$FLOTILLA_DIR/src/data:/data" \
-  -v "$FLOTILLA_DIR/src/val_data:/valdata" \
-  -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
-  flotilla-client:${image_tag} python /generate_dataset.py
+DATA_DIR="${client_data_dir != "" ? client_data_dir : "$FLOTILLA_DIR/src/data"}"
+if [ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
+  echo "STAGE: Generating client dataset partition"
+  mkdir -p "$DATA_DIR" src/val_data
+  sudo docker run --rm \
+    -v "$DATA_DIR:/data" \
+    -v "$FLOTILLA_DIR/src/val_data:/valdata" \
+    -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
+    flotilla-client:${image_tag} python /generate_dataset.py
+else
+  echo "STAGE: Using existing client data in $DATA_DIR"
+fi
 
-sudo docker rm -f flotilla-client >/dev/null 2>&1 || true
-%{ if server_host != "" ~}
-echo "STAGE: Starting flotilla-client (server=${server_host})"
-sudo docker run -d --name flotilla-client --network host --restart unless-stopped \
-  -e CLIENT_NAME=${participant_name} \
-  -e CLIENT_ADVERTISE_HOST=${client_advertise_host} \
-  -e SERVER_GRPC_HOST=${server_host} \
-  -e DISCOVERY_TYPE=${discovery_type} \
-  -e DATASETS_DIR_PATH=/data \
-  -v "$FLOTILLA_DIR/src/data:/data" \
-  flotilla-client:${image_tag}
-echo "STAGE: flotilla-client started"
-%{ else ~}
-echo "WARNING: no output-owner VM registered with governance layer yet — flotilla-client image pulled but not started. Start it once a server exists: docker run -d --name flotilla-client --network host -e CLIENT_NAME=${participant_name} -e CLIENT_ADVERTISE_HOST=${client_advertise_host} -e SERVER_GRPC_HOST=<server-ip> -e DATASETS_DIR_PATH=/data -v $FLOTILLA_DIR/src/data:/data flotilla-client:${image_tag}"
-%{ endif ~}
+echo "STAGE: Preparing the client and its gateway sidecar"
+sudo mkdir -p "$SIDECAR_DIR"
+sudo chown "$GATEWAY_UID:$GATEWAY_UID" "$SIDECAR_DIR"
+sudo chmod 0750 "$SIDECAR_DIR"
+# The client reaches the session only through its sidecar: it has no
+# published ports and sits on an internal-only network with the sidecar.
+# The sidecar's config and the provider's VM credential are written by the
+# orchestrator once this session's server VM is up; it then starts both.
+cat > client-compose.yaml <<COMPOSE
+services:
+  sidecar:
+    image: $GATEWAY_IMAGE
+    container_name: flotilla-sidecar
+    networks: [client, out]
+    ports:
+      - "50054:50054"
+    env_file: [$SIDECAR_DIR/sidecar.env]
+    environment:
+      GATEWAY_MODE: client
+    volumes:
+      - $SIDECAR_DIR:/etc/flotilla-sidecar
+    restart: on-failure:3
+
+  client:
+    image: flotilla-client:${image_tag}
+    container_name: flotilla-gw-client
+    depends_on: [sidecar]
+    networks: [client]
+    environment:
+      CLIENT_NAME: "${participant_name}"
+      CLIENT_ADVERTISE_HOST: flotilla-gw-client
+      SERVER_GRPC_HOST: flotilla-sidecar
+      DISCOVERY_TYPE: grpc
+      DATASETS_DIR_PATH: /data
+    volumes:
+      - $DATA_DIR:/data
+    restart: unless-stopped
+
+networks:
+  client:
+    name: flotilla-gw-client
+    internal: true
+  out:
+    name: flotilla-gw-out
+COMPOSE
+echo "STAGE: Client prepared — it starts once the session's gateway is ready"
 %{ endif ~}

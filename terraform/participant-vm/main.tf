@@ -1,6 +1,16 @@
 locals {
   name_prefix = "flo-${var.role}-${var.participant_name}"
 
+  fl_inbound_rules = {
+    "user" = [
+      { name = "AllowFLGatewayJoin", priority = 1002, port = "50051" },
+      { name = "AllowFLGatewayRest", priority = 1004, port = "12345" },
+    ]
+    "data-provider" = [
+      { name = "AllowFLSidecarRelay", priority = 1003, port = "50054" },
+    ]
+  }
+
   tags = {
     project     = "p3dx-flo"
     role        = var.role
@@ -49,53 +59,27 @@ resource "azurerm_network_security_group" "this" {
     destination_address_prefix = "*"
   }
 
-  # combine_fl's gRPC discovery: flo_server.py binds this on the user/
-  # output-owner VM (server_config.yaml's grpc_discovery.port); data-provider
-  # VMs' flo_client.py connects out to it (client_config.yaml's
-  # grpc_discovery.host/port, wired by configure_broker below). Only matters
-  # on the output-owner VM, but opening it unconditionally is simplest and
-  # harmless — nothing listens on it on a data-provider VM.
-  security_rule {
-    name                       = "AllowFLDiscovery"
-    priority                   = 1002
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "50051"
-    source_address_prefix      = var.allowed_fl_cidr
-    destination_address_prefix = "*"
-  }
-
-  # combine_fl's client-side gRPC runtime server: flo_client.py itself binds
-  # a server (client_config.yaml's grpc_runtime.sync_port, default 50054,
-  # via a port_allocator that can step up a few ports if busy) that the
-  # output-owner's flo_server.py connects back to for actual training
-  # traffic. Only matters on data-provider VMs; harmless elsewhere.
-  security_rule {
-    name                       = "AllowFLClientRuntime"
-    priority                   = 1003
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "50052-50060"
-    source_address_prefix      = var.allowed_fl_cidr
-    destination_address_prefix = "*"
-  }
-
-  # flo_server.py's REST API (session start/status, client_status). Only
-  # matters on a "user" (output-owner) VM; harmless elsewhere.
-  security_rule {
-    name                       = "AllowFLRest"
-    priority                   = 1004
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "12345"
-    source_address_prefix      = var.allowed_fl_cidr
-    destination_address_prefix = "*"
+  # Flotilla join gateway: only the gateway is reachable from outside.
+  #   server VM ("user"): 50051 = client joins (TLS + provider token),
+  #                       12345 = orchestrator REST (TLS + service token);
+  #                       flotilla-server itself publishes nothing.
+  #   client VM ("data-provider"): 50054 = the sidecar's inbound relay that
+  #                       the session's gateway dials for training traffic
+  #                       (the orchestrator narrows it to the server VM's IP
+  #                       after provisioning when it can).
+  dynamic "security_rule" {
+    for_each = local.fl_inbound_rules[var.role == "user" ? "user" : "data-provider"]
+    content {
+      name                       = security_rule.value.name
+      priority                   = security_rule.value.priority
+      direction                  = "Inbound"
+      access                     = "Allow"
+      protocol                   = "Tcp"
+      source_port_range          = "*"
+      destination_port_range     = security_rule.value.port
+      source_address_prefix      = var.allowed_fl_cidr
+      destination_address_prefix = "*"
+    }
   }
 }
 
@@ -202,17 +186,27 @@ resource "null_resource" "wait_for_combine_fl" {
 
   provisioner "file" {
     content = templatefile("${path.module}/templates/cloud-init.sh.tftpl", {
-      role                  = var.role
-      participant_name      = var.participant_name
-      admin_username        = var.admin_username
-      ghcr_namespace        = var.ghcr_namespace
-      ghcr_token            = var.ghcr_token
-      generate_dataset_b64  = filebase64("${path.module}/../../../Flotilla_Deployment/generate_dataset.py")
-      mosquitto_conf_b64    = filebase64("${path.module}/../../../Flotilla_Deployment/deployment/mosquitto.conf")
-      discovery_type        = var.discovery_type
-      image_tag             = var.image_tag
-      server_host           = local.output_owner_ip
-      client_advertise_host = azurerm_public_ip.this[0].ip_address
+      role                    = var.role
+      participant_name        = var.participant_name
+      admin_username          = var.admin_username
+      ghcr_namespace          = var.ghcr_namespace
+      ghcr_token              = var.ghcr_token
+      generate_dataset_b64    = filebase64("${path.module}/../../../Flotilla_Deployment/generate_dataset.py")
+      discovery_type          = var.discovery_type
+      image_tag               = var.image_tag
+      server_host             = local.output_owner_ip
+      client_advertise_host   = azurerm_public_ip.this[0].ip_address
+      self_ip                 = azurerm_public_ip.this[0].ip_address
+      gateway_image           = var.gateway_image != "" ? var.gateway_image : "ghcr.io/${var.ghcr_namespace}/flotilla-gateway:${var.image_tag}"
+      gateway_dir             = var.gateway_dir
+      sidecar_dir             = var.sidecar_dir
+      flotilla_dir            = var.flotilla_dir
+      val_data_dir            = var.val_data_dir
+      client_data_dir         = var.client_data_dir
+      keycloak_issuer         = var.keycloak_issuer
+      keycloak_jwks_url       = var.keycloak_jwks_url
+      gateway_internal_subnet = var.gateway_internal_subnet
+      gateway_internal_ip     = cidrhost(var.gateway_internal_subnet, 10)
     })
     destination = "/tmp/cloud-init.sh"
   }

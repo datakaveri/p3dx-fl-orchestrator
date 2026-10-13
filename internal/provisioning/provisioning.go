@@ -28,6 +28,8 @@ import (
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmcred"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
 
@@ -39,6 +41,8 @@ type Provisioner struct {
 	cfg   *config.Config
 	store *vmsession.Store
 	flow  *flauto.Manager
+	creds *vmcred.Store
+	post  *postapply.Runner
 
 	// tfDir is the participant-vm terraform root, now local to this service
 	// (see config.TerraformDir).
@@ -61,11 +65,13 @@ type Provisioner struct {
 	privateKeys map[string]string // provisioning token -> PEM text, cleared on first download
 }
 
-func New(cfg *config.Config, store *vmsession.Store, flow *flauto.Manager) *Provisioner {
+func New(cfg *config.Config, store *vmsession.Store, flow *flauto.Manager, creds *vmcred.Store, post *postapply.Runner) *Provisioner {
 	return &Provisioner{
 		cfg:                 cfg,
 		store:               store,
 		flow:                flow,
+		creds:               creds,
+		post:                post,
 		tfDir:               cfg.TerraformDir,
 		repoRoot:            filepath.Dir(cfg.ServiceRoot),
 		provisioningLogDir:  filepath.Join(cfg.ServiceRoot, "logs", "vm-provisioning"),
@@ -157,7 +163,6 @@ func (p *Provisioner) copyTerraformSource(runRoot string) (string, error) {
 
 	externalFiles := []string{
 		filepath.Join("Flotilla_Deployment", "generate_dataset.py"),
-		filepath.Join("Flotilla_Deployment", "deployment", "mosquitto.conf"),
 	}
 	for _, rel := range externalFiles {
 		destPath := filepath.Join(runRoot, rel)
@@ -183,6 +188,7 @@ type RunAutoProvisionInput struct {
 	VMName       string
 	RunKey       string // identifies this caller's own instance; guards against a duplicate spawn of the *same* run
 	SubmissionID string // ties this VM run to an FL submission, if any
+	CredentialID string // data-provider: the claimed VM credential to deliver
 }
 
 // RunAutoProvision runs the full device-code-login + terraform-apply flow.
@@ -195,6 +201,11 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 		return
 	}
 	defer p.activeRunKeys.Delete(in.RunKey)
+	// Whatever happens below, a VM credential claimed for this run never
+	// outlives it in memory (Drop is a no-op once it has been delivered).
+	if in.CredentialID != "" {
+		defer p.creds.Drop(in.CredentialID)
+	}
 
 	if in.Role == "data-provider" && in.SubmissionID != "" {
 		p.flow.RegisterProviderToken(in.SubmissionID, in.Token)
@@ -298,6 +309,15 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	if p.cfg.GHCRPullToken != "" {
 		tfOverrides["TF_VAR_ghcr_token"] = p.cfg.GHCRPullToken
 	}
+	// Flotilla join gateway: the server VM's gateway verifies tokens from
+	// this P3DX Keycloak realm. No secret is passed to terraform.
+	tfOverrides["TF_VAR_keycloak_issuer"] = strings.TrimRight(p.cfg.KeycloakBaseURL, "/") + "/realms/" + p.cfg.KeycloakRealm
+	if v := os.Getenv("GATEWAY_KEYCLOAK_JWKS_URL"); v != "" {
+		tfOverrides["TF_VAR_keycloak_jwks_url"] = v
+	}
+	if v := os.Getenv("GATEWAY_IMAGE"); v != "" {
+		tfOverrides["TF_VAR_gateway_image"] = v
+	}
 
 	// Runs in a private copy of the terraform config so this run's
 	// `.terraform/` never collides with another concurrent run's.
@@ -371,8 +391,16 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	}
 	_ = json.Unmarshal([]byte(outputsJSON), &outputs)
 
-	if in.Role == "user" && in.SubmissionID != "" && outputs.PublicIP.Value != "" {
-		p.flow.RegisterOwnerVM(in.SubmissionID, outputs.PublicIP.Value, in.Token)
+	// Flotilla join gateway: secure the server VM's gateway / connect the
+	// client VM to its own session's gateway. Secrets travel over SSH stdin
+	// only (see internal/postapply), never through terraform.
+	if in.SubmissionID != "" && outputs.PublicIP.Value != "" {
+		target := postapply.SSHTarget{Host: outputs.PublicIP.Value, User: p.cfg.SSHUser, Port: p.cfg.SSHPort,
+			KeyPath: keyPath, KnownHosts: filepath.Join(workDir, "known_hosts")}
+		if err := p.runPostApply(in, target, outputs.PublicIP.Value, ev); err != nil {
+			p.fail(ev, participantName, nil, err)
+			return
+		}
 	}
 
 	if key, err := os.ReadFile(keyPath); err == nil {
@@ -388,6 +416,46 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	}
 	msg += " Download your SSH key below."
 	ev.emit("Creating VM", "", "done", msg)
+}
+
+// runPostApply runs the gateway steps that follow terraform apply for an FL
+// submission's VM. For the server VM it secures the gateway and only then
+// announces the VM to flauto; for a client VM it waits for this submission's
+// own server VM and delivers the provider's VM credential.
+func (p *Provisioner) runPostApply(in RunAutoProvisionInput, target postapply.SSHTarget, ip string, ev *eventLogger) error {
+	emit := func(step, status, msg string) { ev.emit(step, "", status, msg) }
+	switch in.Role {
+	case "user":
+		cert, err := p.post.SecureGateway(target, ip, in.SubmissionID, emit)
+		if err != nil {
+			return err
+		}
+		if err := p.flow.SetGatewayCA(in.SubmissionID, cert.CAPEM); err != nil {
+			return err
+		}
+		p.flow.RegisterOwnerVM(in.SubmissionID, ip, in.Token)
+		return nil
+	case "data-provider":
+		if in.CredentialID == "" {
+			return fmt.Errorf("no VM credential for this client VM — authorize the VM first")
+		}
+		emit("Waiting for server VM", "running", "Waiting for this session's server VM and gateway")
+		ownerIP, caPEM, err := p.flow.WaitOwnerIP(in.SubmissionID, p.cfg.OwnerWaitTimeout)
+		if err != nil {
+			p.creds.Drop(in.CredentialID)
+			return err
+		}
+		emit("Waiting for server VM", "ok", "Session gateway at "+ownerIP)
+		token, err := p.creds.Take(in.CredentialID)
+		if err != nil {
+			return err
+		}
+		return p.post.DeliverClient(target, postapply.ClientInput{
+			SubmissionID: in.SubmissionID, CredentialID: in.CredentialID, Token: token,
+			SelfIP: ip, GatewayHost: ownerIP, CAPEM: caPEM,
+		}, emit)
+	}
+	return nil
 }
 
 func (p *Provisioner) fail(ev *eventLogger, participantName string, applyOutputLines []string, cause error) {

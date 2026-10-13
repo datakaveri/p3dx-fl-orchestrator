@@ -5,8 +5,12 @@
 package config
 
 import (
+	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -39,6 +43,34 @@ type Config struct {
 	// terraform plugin cache — all local to this service, not the outer
 	// workspace.
 	ServiceRoot string
+
+	// --- Flotilla join gateway ---
+
+	// The orchestrator's own Keycloak identity (client-credentials grant,
+	// realm role fl-orchestrator): used to request gateway certificates from
+	// gov_layer, to call the gateway's REST API, and for p3dx-aaa callbacks.
+	KeycloakClientID     string // KEYCLOAK_CLIENT_ID (default p3dx-fl-orchestrator)
+	KeycloakClientSecret string // KEYCLOAK_CLIENT_SECRET
+	// FlotillaVMClientID is the Keycloak client VM credentials are minted
+	// for; its tokens are refused on this service's own endpoints.
+	FlotillaVMClientID string // FLOTILLA_VM_CLIENT_ID (default flotilla-vm)
+
+	GovLayerURL  string // GOV_LAYER_URL (default http://localhost:8083/api/v1)
+	AAAURL       string // AAA_URL — p3dx-aaa as this service reaches it
+	AAAPublicURL string // AAA_PUBLIC_URL — p3dx-aaa as client VMs reach it (sidecar token refresh)
+
+	// Paths on the session VMs (cloud-init.sh.tftpl creates them).
+	GatewayDir      string // GATEWAY_DIR (default /etc/flotilla-gateway)
+	SidecarDir      string // SIDECAR_DIR (default /etc/flotilla-sidecar)
+	VMFlotillaDir   string // VM_FLOTILLA_DIR (default flotilla, relative to the VM user's home)
+	GatewayUID      string // GATEWAY_UID — uid the gateway image runs as (default 10001)
+	GatewayRESTPort int    // GATEWAY_REST_PORT (default 12345)
+	SSHUser         string // VM_SSH_USER (default azureuser — participant-vm's admin_username)
+	SSHPort         string // VM_SSH_PORT (default 22)
+
+	VMCredentialClaimTTL time.Duration // VM_CREDENTIAL_CLAIM_TTL (default 30m)
+	OwnerWaitTimeout     time.Duration // OWNER_WAIT_TIMEOUT (default 45m)
+	GatewayReadyTimeout  time.Duration // GATEWAY_READY_TIMEOUT (default 5m)
 }
 
 // LoadEnv loads the service's own .env with OVERRIDE semantics, matching
@@ -65,6 +97,26 @@ func Load() *Config {
 
 		TerraformDir: getEnv("TERRAFORM_DIR", filepath.Join(root, "terraform", "participant-vm")),
 		ServiceRoot:  root,
+
+		KeycloakClientID:     getEnv("KEYCLOAK_CLIENT_ID", "p3dx-fl-orchestrator"),
+		KeycloakClientSecret: os.Getenv("KEYCLOAK_CLIENT_SECRET"),
+		FlotillaVMClientID:   getEnv("FLOTILLA_VM_CLIENT_ID", "flotilla-vm"),
+
+		GovLayerURL:  strings.TrimRight(getEnv("GOV_LAYER_URL", "http://localhost:8083/api/v1"), "/"),
+		AAAURL:       strings.TrimRight(getEnv("AAA_URL", "http://localhost:3001"), "/"),
+		AAAPublicURL: strings.TrimRight(os.Getenv("AAA_PUBLIC_URL"), "/"),
+
+		GatewayDir:      getEnv("GATEWAY_DIR", "/etc/flotilla-gateway"),
+		SidecarDir:      getEnv("SIDECAR_DIR", "/etc/flotilla-sidecar"),
+		VMFlotillaDir:   getEnv("VM_FLOTILLA_DIR", "flotilla"),
+		GatewayUID:      getEnv("GATEWAY_UID", "10001"),
+		GatewayRESTPort: getEnvInt("GATEWAY_REST_PORT", 12345),
+		SSHUser:         getEnv("VM_SSH_USER", "azureuser"),
+		SSHPort:         getEnv("VM_SSH_PORT", "22"),
+
+		VMCredentialClaimTTL: getEnvDuration("VM_CREDENTIAL_CLAIM_TTL", 30*time.Minute),
+		OwnerWaitTimeout:     getEnvDuration("OWNER_WAIT_TIMEOUT", 45*time.Minute),
+		GatewayReadyTimeout:  getEnvDuration("GATEWAY_READY_TIMEOUT", 5*time.Minute),
 	}
 }
 
@@ -73,6 +125,26 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v, err := strconv.Atoi(os.Getenv(key)); err == nil && v > 0 {
+		return v
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		log.Printf("[config] %s=%q is not a positive duration — using %s", key, raw, fallback)
+		return fallback
+	}
+	return d
 }
 
 // serviceRoot returns this process's working directory (start-all.sh launches

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/provisioning"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmcred"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
 
@@ -16,6 +17,9 @@ type autoCreateInput struct {
 	VMName       string `json:"vmName"`
 	RunKey       string `json:"runKey"`
 	SubmissionID string `json:"submissionId"`
+	// CredentialID names the VM credential p3dx-aaa handed over after the
+	// provider authorized this VM; required for a data-provider VM.
+	CredentialID string `json:"credentialId"`
 }
 
 func normalizeRole(role string) string {
@@ -58,12 +62,26 @@ func (s *Server) postAutoCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A client VM can only join an FL session with its provider's VM
+	// credential: claim it now, bound to this provider and submission.
+	if role == "data-provider" && in.SubmissionID != "" {
+		if in.CredentialID == "" {
+			writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "MISSING_CREDENTIAL",
+				"message": "authorize this VM first (credentialId missing)"})
+			return
+		}
+		if _, err := s.creds.Claim(in.CredentialID, username, in.SubmissionID); err != nil {
+			writeJSON(w, http.StatusForbidden, j{"status": "FAILED", "error": "CREDENTIAL_NOT_CLAIMABLE", "message": err.Error()})
+			return
+		}
+	}
+
 	token := s.store.CreateToken(username, role)
 	writeJSON(w, http.StatusAccepted, j{"status": "SUCCESS", "token": token})
 
 	go s.prov.RunAutoProvision(provisioning.RunAutoProvisionInput{
 		Token: token, Username: username, Role: role, VMName: vmName,
-		RunKey: runKey, SubmissionID: in.SubmissionID,
+		RunKey: runKey, SubmissionID: in.SubmissionID, CredentialID: in.CredentialID,
 	})
 }
 
@@ -216,5 +234,34 @@ func (s *Server) postRegisterExpectedProviders(w http.ResponseWriter, r *http.Re
 		return
 	}
 	s.flow.RegisterExpectedProviders(in.SubmissionID, in.Count)
+	writeJSON(w, http.StatusOK, j{"status": "SUCCESS"})
+}
+
+type vmCredentialInput struct {
+	CredentialID string `json:"credential_id"`
+	SubmissionID string `json:"submission_id"`
+	ContractID   string `json:"contract_id"`
+	Username     string `json:"username"`
+	UserID       string `json:"user_id"`
+	OfflineToken string `json:"offline_token"`
+	ExpiresAt    string `json:"expires_at"`
+}
+
+// POST /p3dx/internal/vm-credentials — p3dx-aaa hands over a freshly issued
+// VM credential (X-Internal-Key). Held in memory only until the provider's
+// provisioning run claims and delivers it; never logged.
+func (s *Server) postVMCredential(w http.ResponseWriter, r *http.Request) {
+	var in vmCredentialInput
+	if !readBody(w, r, &in) {
+		return
+	}
+	token := []byte(in.OfflineToken)
+	in.OfflineToken = ""
+	err := s.creds.Put(vmcred.Credential{ID: in.CredentialID, SubmissionID: in.SubmissionID, ContractID: in.ContractID,
+		Username: in.Username, UserID: in.UserID, ExpiresAt: in.ExpiresAt}, token)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "INVALID_CREDENTIAL", "message": err.Error()})
+		return
+	}
 	writeJSON(w, http.StatusOK, j{"status": "SUCCESS"})
 }
