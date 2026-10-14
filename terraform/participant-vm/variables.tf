@@ -75,11 +75,11 @@ variable "image_tag" {
 variable "ghcr_namespace" {
   description = "GitHub Container Registry namespace (user or org) the flotilla-server/flotilla-client/flotilla-session images are pushed to, e.g. ghcr.io/<ghcr_namespace>/flotilla-server:<image_tag>."
   type        = string
-  default     = "saravan-04"
+  default     = "datakaveri"
 }
 
 variable "ghcr_token" {
-  description = "Token the VM uses to `docker login ghcr.io` before pulling the (private) flotilla images — a GitHub PAT/token with at least read:packages scope for ghcr_namespace. Required; these images are private."
+  description = "Token the VM uses to `docker login ghcr.io` before pulling the flotilla images — a GitHub PAT/token with at least read:packages scope for ghcr_namespace. Optional: leave empty while the images are public (the VM then skips the login)."
   type        = string
   default     = ""
   sensitive   = true
@@ -145,7 +145,7 @@ variable "subnet_prefix" {
 variable "gateway_image" {
   description = "Flotilla gateway/sidecar image. Empty = ghcr.io/<ghcr_namespace>/flotilla-gateway:<image_tag>. Pulled only if not already on the VM."
   type        = string
-  default     = ""
+  default     = "ghcr.io/datakaveri/flotilla-gateway:cpu"
 }
 
 variable "keycloak_issuer" {
