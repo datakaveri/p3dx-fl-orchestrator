@@ -144,7 +144,7 @@ func (p *Provisioner) deviceCodeLogin(env []string, ev *eventLogger) error {
 // `${path.module}/../../../Flotilla_Deployment/...` reference expects, so it
 // resolves correctly inside the isolated copy too. State still lands in the
 // one persistent, shared location per participant it always has.
-func (p *Provisioner) copyTerraformSource(runRoot string) (string, error) {
+func (p *Provisioner) copyTerraformSource(runRoot string, dryRun bool) (string, error) {
 	serviceDirName := filepath.Base(p.cfg.ServiceRoot)
 	destDir := filepath.Join(runRoot, serviceDirName, "terraform", "participant-vm")
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
@@ -158,6 +158,22 @@ func (p *Provisioner) copyTerraformSource(runRoot string) (string, error) {
 		}
 		if err := runCp(src, filepath.Join(destDir, entry)); err != nil {
 			return "", err
+		}
+	}
+
+	// Dry run: swap in the azurerm-free main/outputs/versions from dry-run/.
+	if dryRun {
+		overlay, err := os.ReadDir(filepath.Join(p.tfDir, "dry-run"))
+		if err != nil {
+			return "", err
+		}
+		for _, f := range overlay {
+			if f.IsDir() {
+				continue
+			}
+			if err := runCp(filepath.Join(p.tfDir, "dry-run", f.Name()), filepath.Join(destDir, f.Name())); err != nil {
+				return "", err
+			}
 		}
 	}
 
@@ -244,8 +260,20 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	}
 	defer cleanup()
 
-	ev.emit("Starting", "", "running",
-		fmt.Sprintf(`Provisioning VM "%s" for %s (%s) — this needs one more Azure sign-in for Terraform itself.`, in.VMName, in.Username, in.Role))
+	dryRun := len(p.cfg.DryRunVMs) > 0
+	dryRunHost := p.cfg.DryRunVMs[in.Role]
+	if dryRun && dryRunHost == "" {
+		p.fail(ev, participantName, nil, fmt.Errorf("dry run is on (DRY_RUN_VMS) but has no VM for role %q", in.Role))
+		return
+	}
+
+	if dryRun {
+		ev.emit("Starting", "", "running",
+			fmt.Sprintf(`Provisioning VM "%s" for %s (%s) in dry-run mode.`, in.VMName, in.Username, in.Role))
+	} else {
+		ev.emit("Starting", "", "running",
+			fmt.Sprintf(`Provisioning VM "%s" for %s (%s) — this needs one more Azure sign-in for Terraform itself.`, in.VMName, in.Username, in.Role))
+	}
 
 	var err error
 	workDir, err = os.MkdirTemp("", "p3dx-vm-")
@@ -259,30 +287,38 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 		"TF_IN_AUTOMATION": "1",
 	}))
 
-	ev.emit("Azure device login", "az login --use-device-code", "running", "Waiting for you to sign in via the code above...")
-	if err := p.deviceCodeLogin(env, ev); err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
-		return
-	}
-	ev.emit("Azure device login", "", "ok", "Signed in")
+	createdBy := "dry-run"
+	if dryRun {
+		// "ok", not "skipped": the UI's STEP_ICON has no icon for "skipped".
+		ev.emit("Azure device login", "", "ok",
+			fmt.Sprintf("Dry run: using existing VM %s — no Azure sign-in, no VM creation", dryRunHost))
+	} else {
+		ev.emit("Azure device login", "az login --use-device-code", "running", "Waiting for you to sign in via the code above...")
+		if err := p.deviceCodeLogin(env, ev); err != nil {
+			p.fail(ev, participantName, applyOutputLines, err)
+			return
+		}
+		ev.emit("Azure device login", "", "ok", "Signed in")
 
-	accountJSON, _, err := runCommand("az", []string{"account", "show", "-o", "json"}, "", env, nil)
-	if err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
-		return
-	}
-	var account struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-		User struct {
+		accountJSON, _, err := runCommand("az", []string{"account", "show", "-o", "json"}, "", env, nil)
+		if err != nil {
+			p.fail(ev, participantName, applyOutputLines, err)
+			return
+		}
+		var account struct {
+			ID   string `json:"id"`
 			Name string `json:"name"`
-		} `json:"user"`
+			User struct {
+				Name string `json:"name"`
+			} `json:"user"`
+		}
+		if err := json.Unmarshal([]byte(accountJSON), &account); err != nil {
+			p.fail(ev, participantName, applyOutputLines, err)
+			return
+		}
+		ev.emit("Azure account", "", "ok", fmt.Sprintf(`Using subscription "%s" (%s)`, account.Name, account.ID))
+		createdBy = orDefault(account.User.Name, account.ID)
 	}
-	if err := json.Unmarshal([]byte(accountJSON), &account); err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
-		return
-	}
-	ev.emit("Azure account", "", "ok", fmt.Sprintf(`Using subscription "%s" (%s)`, account.Name, account.ID))
 
 	keyPath = filepath.Join(workDir, "id_ed25519")
 	ev.emit("SSH key", "", "running", "Generating a fresh SSH keypair for this VM")
@@ -295,9 +331,13 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	tfOverrides := map[string]string{
 		"TF_VAR_role":                 in.Role,
 		"TF_VAR_participant_name":     participantName,
-		"TF_VAR_created_by":           orDefault(account.User.Name, account.ID),
+		"TF_VAR_created_by":           createdBy,
 		"TF_VAR_ssh_public_key_path":  keyPath + ".pub",
 		"TF_VAR_ssh_private_key_path": keyPath,
+	}
+	if dryRun {
+		tfOverrides["TF_VAR_existing_vm_ip"] = dryRunHost
+		tfOverrides["TF_VAR_admin_username"] = p.cfg.SSHUser
 	}
 	// Lets the VM `docker login ghcr.io` and pull the pre-built
 	// flotilla-server/client/session images instead of git-cloning and
@@ -326,6 +366,11 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	// (terraform.tfstate.d/<name>/terraform.tfstate under tfDir), so nothing
 	// about where state lives actually changes.
 	statePath := filepath.Join(p.tfDir, "terraform.tfstate.d", participantName, "terraform.tfstate")
+	if dryRun {
+		// Kept apart from real runs' state: a dry run has no azurerm
+		// resources, so sharing a participant's real state would break both.
+		statePath = filepath.Join(p.tfDir, "terraform.tfstate.d", "dry-run", participantName, "terraform.tfstate")
+	}
 	if err := os.MkdirAll(p.pluginCacheDir, 0o755); err != nil {
 		p.fail(ev, participantName, applyOutputLines, err)
 		return
@@ -341,7 +386,7 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	})))
 
 	ev.emit("Preparing Terraform config", "", "running", "Setting up an isolated working directory for this run")
-	runTfDir, err := p.copyTerraformSource(workDir)
+	runTfDir, err := p.copyTerraformSource(workDir, dryRun)
 	if err != nil {
 		p.fail(ev, participantName, applyOutputLines, err)
 		return

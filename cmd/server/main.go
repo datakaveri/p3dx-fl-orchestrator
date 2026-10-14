@@ -28,6 +28,10 @@ func main() {
 		log.Fatal("[fl-orchestrator] KEYCLOAK_CLIENT_SECRET must be set: the orchestrator's service account secures session gateways")
 	}
 
+	if len(cfg.DryRunVMs) > 0 {
+		log.Printf("[fl-orchestrator] DRY RUN: no Azure sign-in or VM creation; using existing VMs %v", cfg.DryRunVMs)
+	}
+
 	api := httpapi.New(cfg)
 
 	server := &http.Server{

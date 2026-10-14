@@ -5,6 +5,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -68,6 +69,11 @@ type Config struct {
 	SSHUser         string // VM_SSH_USER (default azureuser — participant-vm's admin_username)
 	SSHPort         string // VM_SSH_PORT (default 22)
 
+	// DryRunVMs (DRY_RUN_VMS, "role=host,role=host") is a test-only mode: runs
+	// use these existing VMs per role instead of signing in to Azure and
+	// creating one. Empty = normal runs.
+	DryRunVMs map[string]string
+
 	VMCredentialClaimTTL time.Duration // VM_CREDENTIAL_CLAIM_TTL (default 30m)
 	OwnerWaitTimeout     time.Duration // OWNER_WAIT_TIMEOUT (default 45m)
 	GatewayReadyTimeout  time.Duration // GATEWAY_READY_TIMEOUT (default 5m)
@@ -82,6 +88,11 @@ func LoadEnv() {
 // Load reads configuration from the environment.
 func Load() *Config {
 	root := serviceRoot()
+
+	dryRunVMs, err := ParseDryRunVMs(os.Getenv("DRY_RUN_VMS"))
+	if err != nil {
+		log.Fatalf("[config] DRY_RUN_VMS: %v", err)
+	}
 
 	return &Config{
 		Port:    getEnv("PORT", "3002"),
@@ -114,10 +125,33 @@ func Load() *Config {
 		SSHUser:         getEnv("VM_SSH_USER", "azureuser"),
 		SSHPort:         getEnv("VM_SSH_PORT", "22"),
 
+		DryRunVMs: dryRunVMs,
+
 		VMCredentialClaimTTL: getEnvDuration("VM_CREDENTIAL_CLAIM_TTL", 30*time.Minute),
 		OwnerWaitTimeout:     getEnvDuration("OWNER_WAIT_TIMEOUT", 45*time.Minute),
 		GatewayReadyTimeout:  getEnvDuration("GATEWAY_READY_TIMEOUT", 5*time.Minute),
 	}
+}
+
+// ParseDryRunVMs parses DRY_RUN_VMS ("user=<host>,data-provider=<host>") into a
+// role -> host map. Empty input means dry-run is off.
+func ParseDryRunVMs(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	if strings.TrimSpace(raw) == "" {
+		return out, nil
+	}
+	for _, entry := range strings.Split(raw, ",") {
+		role, host, ok := strings.Cut(entry, "=")
+		role, host = strings.TrimSpace(role), strings.TrimSpace(host)
+		if !ok || role == "" || host == "" {
+			return nil, fmt.Errorf("malformed entry %q (want role=host)", strings.TrimSpace(entry))
+		}
+		if role != "user" && role != "data-provider" {
+			return nil, fmt.Errorf("unknown role %q (want user or data-provider)", role)
+		}
+		out[role] = host
+	}
+	return out, nil
 }
 
 func getEnv(key, fallback string) string {
