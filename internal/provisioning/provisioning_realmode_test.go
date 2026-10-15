@@ -127,7 +127,7 @@ func TestRunAutoProvisionRealModeUnchanged(t *testing.T) {
 	log, evs := f.run(t, "user")
 
 	for _, want := range []string{
-		"CMD az login --use-device-code",
+		"CMD az login --use-device-code\n", // no --tenant when AZURE_TENANT_ID is unset
 		"CMD az account show -o json",
 		"CMD ssh-keygen -t ed25519",
 		"CMD terraform init -input=false -no-color -backend-config=path=" + filepath.Join(f.tfDir, "terraform.tfstate.d", "my-vm", "terraform.tfstate") + "\n",
@@ -162,6 +162,19 @@ func TestRunAutoProvisionRealModeUnchanged(t *testing.T) {
 	}
 	if first := evs[0]; first.Step != "Starting" || !strings.Contains(first.Message, "one more Azure sign-in") {
 		t.Errorf("first event = %+v", first)
+	}
+}
+
+func TestRunAutoProvisionTenantPinned(t *testing.T) {
+	f := newRMFixture(t, nil)
+	f.p.cfg.AzureTenantID = "tenant-abc"
+	log, evs := f.run(t, "user")
+
+	if !strings.Contains(log, "CMD az login --use-device-code --tenant tenant-abc\n") {
+		t.Errorf("az login not pinned to the tenant:\n%s", log)
+	}
+	if last := evs[len(evs)-1]; last.Step != "Creating VM" || last.Status != "done" {
+		t.Errorf("last event = %+v", last)
 	}
 }
 

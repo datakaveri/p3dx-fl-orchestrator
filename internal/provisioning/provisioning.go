@@ -126,7 +126,11 @@ var deviceCodeLineRe = regexp.MustCompile(`(?i)devicelogin|enter the code`)
 // provisioning event the moment Azure CLI prints it.
 func (p *Provisioner) deviceCodeLogin(env []string, ev *eventLogger) error {
 	announced := false
-	_, _, err := runCommand("az", []string{"login", "--use-device-code"}, "", env, func(line string) {
+	args := []string{"login", "--use-device-code"}
+	if p.cfg.AzureTenantID != "" {
+		args = append(args, "--tenant", p.cfg.AzureTenantID)
+	}
+	_, _, err := runCommand("az", args, "", env, func(line string) {
 		if !announced && deviceCodeLineRe.MatchString(line) {
 			announced = true
 			ev.emit("Azure device login", "", "running", line)

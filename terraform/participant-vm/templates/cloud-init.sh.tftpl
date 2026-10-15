@@ -60,11 +60,13 @@ VAL_DATA_DIR="${val_data_dir != "" ? val_data_dir : "$FLOTILLA_DIR/src/val_data"
 if [ -z "$(ls -A "$VAL_DATA_DIR" 2>/dev/null)" ]; then
   echo "STAGE: Generating validation dataset partition"
   mkdir -p "$VAL_DATA_DIR" src/data
-  sudo docker run --rm \
+  # --entrypoint: the image's own entrypoint always starts Flotilla and
+  # ignores any command given, so the generator would never run otherwise.
+  sudo docker run --rm --entrypoint python \
     -v "$VAL_DATA_DIR:/valdata" \
     -v "$FLOTILLA_DIR/src/data:/data" \
     -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
-    flotilla-server:${image_tag} python /generate_dataset.py
+    flotilla-server:${image_tag} /generate_dataset.py
 else
   echo "STAGE: Using existing validation data in $VAL_DATA_DIR"
 fi
@@ -169,11 +171,12 @@ DATA_DIR="${client_data_dir != "" ? client_data_dir : "$FLOTILLA_DIR/src/data"}"
 if [ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
   echo "STAGE: Generating client dataset partition"
   mkdir -p "$DATA_DIR" src/val_data
-  sudo docker run --rm \
+  # --entrypoint: see the server branch above.
+  sudo docker run --rm --entrypoint python \
     -v "$DATA_DIR:/data" \
     -v "$FLOTILLA_DIR/src/val_data:/valdata" \
     -v "$FLOTILLA_DIR/generate_dataset.py:/generate_dataset.py:ro" \
-    flotilla-client:${image_tag} python /generate_dataset.py
+    flotilla-client:${image_tag} /generate_dataset.py
 else
   echo "STAGE: Using existing client data in $DATA_DIR"
 fi

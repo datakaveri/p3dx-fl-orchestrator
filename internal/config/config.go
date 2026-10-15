@@ -35,6 +35,11 @@ type Config struct {
 	GHCRNamespace string
 	GHCRPullToken string
 
+	// AzureTenantID (AZURE_TENANT_ID), when set, pins the device-code login to
+	// this Microsoft Entra tenant (`az login --tenant`), so a personal Microsoft
+	// account sharing the same email can't be picked instead of the work one.
+	AzureTenantID string
+
 	// TerraformDir is the participant-vm terraform root, local to this
 	// service now (moved in from the workspace-root terraform/ directory).
 	TerraformDir string
@@ -105,6 +110,8 @@ func Load() *Config {
 
 		GHCRNamespace: os.Getenv("GHCR_NAMESPACE"),
 		GHCRPullToken: os.Getenv("GHCR_PULL_TOKEN"),
+
+		AzureTenantID: strings.TrimSpace(os.Getenv("AZURE_TENANT_ID")),
 
 		TerraformDir: getEnv("TERRAFORM_DIR", filepath.Join(root, "terraform", "participant-vm")),
 		ServiceRoot:  root,
