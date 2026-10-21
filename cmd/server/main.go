@@ -21,6 +21,16 @@ import (
 func main() {
 	config.LoadEnv()
 	cfg := config.Load()
+	if cfg.InternalServiceKey == "" {
+		log.Fatal("[fl-orchestrator] INTERNAL_SERVICE_KEY must be set: VM credentials are handed over on the internal routes")
+	}
+	if cfg.KeycloakClientSecret == "" {
+		log.Fatal("[fl-orchestrator] KEYCLOAK_CLIENT_SECRET must be set: the orchestrator's service account secures session gateways")
+	}
+
+	if len(cfg.DryRunVMs) > 0 {
+		log.Printf("[fl-orchestrator] DRY RUN: no Azure sign-in or VM creation; using existing VMs %v", cfg.DryRunVMs)
+	}
 
 	api := httpapi.New(cfg)
 

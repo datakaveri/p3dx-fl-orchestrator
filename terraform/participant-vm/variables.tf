@@ -61,7 +61,7 @@ variable "ssh_private_key_path" {
 }
 
 variable "discovery_type" {
-  description = "combine_fl discovery mechanism both server and every client must agree on."
+  description = "Kept for compatibility; the Flotilla join gateway always uses gRPC discovery (MQTT would bypass it)."
   type        = string
   default     = "grpc"
 }
@@ -75,11 +75,11 @@ variable "image_tag" {
 variable "ghcr_namespace" {
   description = "GitHub Container Registry namespace (user or org) the flotilla-server/flotilla-client/flotilla-session images are pushed to, e.g. ghcr.io/<ghcr_namespace>/flotilla-server:<image_tag>."
   type        = string
-  default     = "saravan-04"
+  default     = "datakaveri"
 }
 
 variable "ghcr_token" {
-  description = "Token the VM uses to `docker login ghcr.io` before pulling the (private) flotilla images — a GitHub PAT/token with at least read:packages scope for ghcr_namespace. Required; these images are private."
+  description = "Token the VM uses to `docker login ghcr.io` before pulling the flotilla images — a GitHub PAT/token with at least read:packages scope for ghcr_namespace. Optional: leave empty while the images are public (the VM then skips the login)."
   type        = string
   default     = ""
   sensitive   = true
@@ -138,4 +138,60 @@ variable "subnet_prefix" {
   description = "Address prefix for the VM's subnet (must fall inside vnet_address_space)."
   type        = string
   default     = "10.20.0.0/26"
+}
+
+# --- Flotilla join gateway --------------------------------------------------
+
+variable "gateway_image" {
+  description = "Flotilla gateway/sidecar image. Empty = ghcr.io/<ghcr_namespace>/flotilla-gateway:<image_tag>. Pulled only if not already on the VM."
+  type        = string
+  default     = "ghcr.io/datakaveri/flotilla-gateway:cpu"
+}
+
+variable "keycloak_issuer" {
+  description = "Issuer (iss) of the P3DX Keycloak realm whose tokens the gateway verifies, e.g. https://<keycloak>/realms/master. Required on the server VM."
+  type        = string
+  default     = "http://localhost:8080/realms/master"
+}
+
+variable "keycloak_jwks_url" {
+  description = "JWKS URL the gateway fetches signing keys from, if it differs from <keycloak_issuer>/protocol/openid-connect/certs (e.g. a different host name for the same Keycloak)."
+  type        = string
+  default     = ""
+}
+
+variable "gateway_dir" {
+  description = "Server VM: directory holding the gateway's key (generated on the VM), certificate and parties.json."
+  type        = string
+  default     = "/etc/flotilla-gateway"
+}
+
+variable "sidecar_dir" {
+  description = "Client VM: directory holding the sidecar config, CA certificate and the provider's VM credential."
+  type        = string
+  default     = "/etc/flotilla-sidecar"
+}
+
+variable "flotilla_dir" {
+  description = "Working directory on the VM. Empty = /home/<admin_username>/flotilla."
+  type        = string
+  default     = ""
+}
+
+variable "val_data_dir" {
+  description = "Server VM: validation data directory. Empty = <flotilla_dir>/src/val_data. Generated only if empty."
+  type        = string
+  default     = ""
+}
+
+variable "client_data_dir" {
+  description = "Client VM: training data directory. Empty = <flotilla_dir>/src/data. Generated only if empty."
+  type        = string
+  default     = ""
+}
+
+variable "gateway_internal_subnet" {
+  description = "Subnet of the server VM's internal-only Docker network (flotilla-server, redis, gateway). The gateway takes host .10."
+  type        = string
+  default     = "172.29.0.0/24"
 }

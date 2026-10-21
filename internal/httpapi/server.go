@@ -8,6 +8,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -16,11 +17,14 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/provisioning"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmcred"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
 
@@ -32,13 +36,16 @@ type Server struct {
 	store *vmsession.Store
 	flow  *flauto.Manager
 	prov  *provisioning.Provisioner
+	creds *vmcred.Store
 }
 
 func New(cfg *config.Config) *Server {
 	store := vmsession.NewStore()
-	flow := flauto.NewManager(store)
-	prov := provisioning.New(cfg, store, flow)
-	return &Server{cfg: cfg, store: store, flow: flow, prov: prov}
+	tokens := keycloak.NewTokenSource(cfg.KeycloakBaseURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret)
+	flow := flauto.NewManager(store, tokens.Token, cfg.GatewayRESTPort)
+	creds := vmcred.NewStore(cfg.VMCredentialClaimTTL)
+	prov := provisioning.New(cfg, store, flow, creds, postapply.New(cfg, tokens))
+	return &Server{cfg: cfg, store: store, flow: flow, prov: prov, creds: creds}
 }
 
 // Handler returns the root http.Handler.
@@ -64,6 +71,7 @@ func (s *Server) registerRoutes(r chi.Router) {
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireInternalKey)
 		r.Post("/internal/register-expected-providers", s.postRegisterExpectedProviders)
+		r.Post("/internal/vm-credentials", s.postVMCredential)
 	})
 }
 
@@ -109,6 +117,12 @@ func (s *Server) requireJWT(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusUnauthorized, j{"status": "FAILED", "error": "INVALID_OR_EXPIRED_TOKEN"})
 			return
 		}
+		// Flotilla VM tokens only let a VM rejoin its FL session at the
+		// gateway; they never pass as a user here.
+		if claims, ok := tok.Claims.(jwt.MapClaims); ok && keycloak.Azp(claims) == s.cfg.FlotillaVMClientID {
+			writeJSON(w, http.StatusForbidden, j{"status": "FAILED", "error": "VM_TOKEN_NOT_ALLOWED"})
+			return
+		}
 		username := keycloak.PreferredUsername(tok)
 		ctx := context.WithValue(r.Context(), usernameCtxKey{}, username)
 		next.ServeHTTP(w, r.WithContext(ctx))
@@ -120,12 +134,13 @@ func usernameFromCtx(r *http.Request) string {
 	return username
 }
 
-// requireInternalKey guards the service-to-service register-expected-providers
-// endpoint. An empty INTERNAL_SERVICE_KEY disables the check (local dev
-// default), same convention as gov_layer's VM_REGISTRY_TOKEN.
+// requireInternalKey guards the service-to-service endpoints p3dx-aaa calls
+// (register-expected-providers, vm-credentials). INTERNAL_SERVICE_KEY is
+// required: VM credentials arrive on this route, so it is never left open.
 func (s *Server) requireInternalKey(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.InternalServiceKey != "" && r.Header.Get("X-Internal-Key") != s.cfg.InternalServiceKey {
+		if s.cfg.InternalServiceKey == "" ||
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Internal-Key")), []byte(s.cfg.InternalServiceKey)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, j{"status": "FAILED", "error": "UNAUTHORIZED"})
 			return
 		}
