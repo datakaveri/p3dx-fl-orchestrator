@@ -18,6 +18,7 @@ package provisioning
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,9 @@ type Provisioner struct {
 	// plugins (azurerm is large) so concurrent runs' `terraform init` calls
 	// reuse one download instead of each fetching it again.
 	pluginCacheDir string
+	// initMu serialises `terraform init`: the plugin cache isn't safe for
+	// concurrent installs ("text file busy" when two runs write one provider).
+	initMu sync.Mutex
 
 	activeRunKeys sync.Map // runKey -> struct{}
 
@@ -88,6 +92,19 @@ func (p *Provisioner) IsProvisioning(runKey string) bool {
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
 var trimDashRe = regexp.MustCompile(`^-+|-+$`)
+
+// dryRunHostFor picks this run's existing VM from DRY_RUN_VMS: a
+// "vm:<VM Name>" entry whose name slugifies to participantName wins, so two
+// providers (same role) can each be pinned to their own VM; otherwise the
+// role's entry. "" = no VM configured for this run.
+func dryRunHostFor(vms map[string]string, role, participantName string) string {
+	for key, host := range vms {
+		if name, ok := strings.CutPrefix(key, "vm:"); ok && slugify(name) == participantName {
+			return host
+		}
+	}
+	return vms[role]
+}
 
 func slugify(name string) string {
 	slug := strings.ToLower(strings.TrimSpace(name))
@@ -265,9 +282,9 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	defer cleanup()
 
 	dryRun := len(p.cfg.DryRunVMs) > 0
-	dryRunHost := p.cfg.DryRunVMs[in.Role]
+	dryRunHost := dryRunHostFor(p.cfg.DryRunVMs, in.Role, participantName)
 	if dryRun && dryRunHost == "" {
-		p.fail(ev, participantName, nil, fmt.Errorf("dry run is on (DRY_RUN_VMS) but has no VM for role %q", in.Role))
+		p.fail(ev, participantName, nil, fmt.Errorf("dry run is on (DRY_RUN_VMS) but has no VM for VM Name %q or role %q", in.VMName, in.Role))
 		return
 	}
 
@@ -398,7 +415,10 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	ev.emit("Preparing Terraform config", "", "ok", "")
 
 	ev.emit("Terraform init", "terraform init -input=false", "running", "")
-	if _, _, err := runCommand("terraform", []string{"init", "-input=false", "-no-color", "-backend-config=path=" + statePath}, runTfDir, tfEnv, nil); err != nil {
+	p.initMu.Lock()
+	_, _, err = runCommand("terraform", []string{"init", "-input=false", "-no-color", "-backend-config=path=" + statePath}, runTfDir, tfEnv, nil)
+	p.initMu.Unlock()
+	if err != nil {
 		p.fail(ev, participantName, applyOutputLines, err)
 		return
 	}
@@ -481,6 +501,11 @@ func (p *Provisioner) runPostApply(in RunAutoProvisionInput, target postapply.SS
 		}
 		if err := p.flow.SetGatewayCA(in.SubmissionID, cert.CAPEM); err != nil {
 			return err
+		}
+		// Keep this server VM's SSH key past the run's temp dir, so the FL
+		// output (final model) can be fetched from it after the session.
+		if err := p.flow.SaveOwnerAccess(in.SubmissionID, ip, target.KeyPath, target.KnownHosts); err != nil {
+			log.Printf("[vm-provisioning] submission %s: could not keep the server VM's SSH key for output collection: %v", in.SubmissionID, err)
 		}
 		p.flow.RegisterOwnerVM(in.SubmissionID, ip, in.Token)
 		return nil

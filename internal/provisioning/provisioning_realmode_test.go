@@ -205,6 +205,29 @@ func TestRunAutoProvisionDryRunMode(t *testing.T) {
 	}
 }
 
+func TestRunAutoProvisionDryRunVMNameWins(t *testing.T) {
+	// "My VM" slugifies to my-vm, the fixture's participant name.
+	f := newRMFixture(t, map[string]string{"user": "192.0.2.10", "vm:My VM": "192.0.2.30", "vm:other": "192.0.2.40"})
+	log, _ := f.run(t, "user")
+
+	if !strings.Contains(log, "ENV TF_VAR_existing_vm_ip=192.0.2.30") {
+		t.Errorf("want the vm:My VM host, got:\n%s", log)
+	}
+}
+
+func TestDryRunHostFor(t *testing.T) {
+	vms := map[string]string{"data-provider": "192.0.2.20", "vm:Client 2": "192.0.2.30"}
+	for _, tc := range []struct{ role, name, want string }{
+		{"data-provider", "client-2", "192.0.2.30"},
+		{"data-provider", "client-1", "192.0.2.20"},
+		{"user", "client-1", ""},
+	} {
+		if got := dryRunHostFor(vms, tc.role, tc.name); got != tc.want {
+			t.Errorf("dryRunHostFor(%q, %q) = %q, want %q", tc.role, tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestRunAutoProvisionDryRunMissingRole(t *testing.T) {
 	f := newRMFixture(t, map[string]string{"data-provider": "192.0.2.20"})
 	log, evs := f.run(t, "user")

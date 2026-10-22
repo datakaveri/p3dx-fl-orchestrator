@@ -15,6 +15,7 @@ package postapply
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -64,6 +65,23 @@ func (t SSHTarget) Run(remote string, stdin []byte) (string, error) {
 		return out.String(), fmt.Errorf("ssh %s@%s %q: %w: %s", t.User, t.Host, remote, err, msg)
 	}
 	return out.String(), nil
+}
+
+// Stream executes remote on the VM and copies its stdout to w as it arrives
+// (for large files: nothing is buffered here). The returned error carries the
+// command's stderr.
+func (t SSHTarget) Stream(remote string, w io.Writer) error {
+	cmd := exec.Command(sshBinary, t.args(remote)...)
+	var errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = w, &errb
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(errb.String())
+		if len(msg) > 600 {
+			msg = msg[len(msg)-600:]
+		}
+		return fmt.Errorf("ssh %s@%s %q: %w: %s", t.User, t.Host, remote, err, msg)
+	}
+	return nil
 }
 
 // RunRetry retries Run while the VM is still coming up (sshd not ready yet).

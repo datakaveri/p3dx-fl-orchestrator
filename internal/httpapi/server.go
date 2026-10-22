@@ -43,6 +43,11 @@ func New(cfg *config.Config) *Server {
 	store := vmsession.NewStore()
 	tokens := keycloak.NewTokenSource(cfg.KeycloakBaseURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret)
 	flow := flauto.NewManager(store, tokens.Token, cfg.GatewayRESTPort)
+	flow.ConfigureOutput(flauto.OutputConfig{
+		GovLayerURL: cfg.GovLayerURL, VMFlotillaDir: cfg.VMFlotillaDir,
+		SSHUser: cfg.SSHUser, SSHPort: cfg.SSHPort,
+		StateDir: cfg.FLOutputStateDir, VMRegistryToken: cfg.VMRegistryToken,
+	})
 	creds := vmcred.NewStore(cfg.VMCredentialClaimTTL)
 	prov := provisioning.New(cfg, store, flow, creds, postapply.New(cfg, tokens))
 	return &Server{cfg: cfg, store: store, flow: flow, prov: prov, creds: creds}
@@ -62,6 +67,7 @@ func (s *Server) registerRoutes(r chi.Router) {
 		r.Post("/vm-provisioning/auto-create", s.postAutoCreate)
 		r.Get("/vm-provisioning/private-key", s.getPrivateKey)
 		r.Post("/vm-provisioning/token", s.postToken)
+		r.Post("/fl-output/{submissionId}/collect", s.postCollectFLOutput)
 	})
 	// Token-authenticated (deploy.sh has no browser session / JWT) or
 	// unauthenticated by nature (SSE — EventSource can't set headers).

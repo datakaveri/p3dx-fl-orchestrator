@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
 
@@ -66,6 +67,15 @@ type Manager struct {
 
 	mu          sync.Mutex
 	submissions map[string]*submissionState
+
+	// output collection (output.go)
+	out               OutputConfig
+	collectMu         sync.Mutex
+	collecting        map[string]bool
+	newSSH            func(postapply.SSHTarget) sshRunner // tests: stub SSH
+	uploadClient      *http.Client                        // tests: nil = default client
+	queryPastAttempts int
+	queryPastWait     time.Duration
 }
 
 func NewManager(store *vmsession.Store, token TokenFunc, restPort int) *Manager {
@@ -83,6 +93,10 @@ func (m *Manager) client(s *submissionState, timeout time.Duration) *http.Client
 	s.mu.Lock()
 	pool := s.gatewayCA
 	s.mu.Unlock()
+	return httpsClient(pool, timeout)
+}
+
+func httpsClient(pool *x509.CertPool, timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout, Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
 	}}
@@ -353,6 +367,13 @@ func (m *Manager) startSession(submissionID string, s *submissionState) {
 			msg = fmt.Sprintf("Session %s finished", sessionID)
 		}
 		m.emit(s, "FL session", "done", msg)
+		// Pull the final model + metrics into gov_layer straight away; the
+		// output owner can re-trigger it (POST /p3dx/fl-output/{id}/collect).
+		go func() {
+			if err := m.collectOutput(submissionID); err != nil {
+				log.Printf("[flauto] submission %s: output collection: %v", submissionID, err)
+			}
+		}()
 	}()
 
 	m.emit(s, "Starting FL session", "ok", fmt.Sprintf("Session %s started — training is now running on the server VM", sessionID))
