@@ -74,9 +74,20 @@ type Config struct {
 	SSHUser         string // VM_SSH_USER (default azureuser — participant-vm's admin_username)
 	SSHPort         string // VM_SSH_PORT (default 22)
 
-	// DryRunVMs (DRY_RUN_VMS, "role=host,role=host") is a test-only mode: runs
-	// use these existing VMs per role instead of signing in to Azure and
-	// creating one. Empty = normal runs.
+	// FLOutputStateDir (FL_OUTPUT_STATE_DIR, default <ServiceRoot>/state/fl-owner)
+	// keeps each submission's output-owner (server) VM SSH key, known_hosts
+	// and IP, so FL output can be collected after the provisioning run's
+	// temp dir is wiped or the service restarts. Only the server VM's key.
+	FLOutputStateDir string
+	// VMRegistryToken (VM_REGISTRY_TOKEN) is sent as X-VM-Registry-Token to
+	// gov_layer's /vm-registry/output-owner (restart fallback for the owner IP).
+	VMRegistryToken string
+
+	// DryRunVMs (DRY_RUN_VMS, "role=host,vm:<VM Name>=host,...") is a
+	// test-only mode: runs use these existing VMs instead of signing in to
+	// Azure and creating one. A "vm:<VM Name>" entry pins the run whose VM
+	// Name matches to that host (so several providers can each get their own
+	// VM); otherwise the run's role picks the host. Empty = normal runs.
 	DryRunVMs map[string]string
 
 	VMCredentialClaimTTL time.Duration // VM_CREDENTIAL_CLAIM_TTL (default 30m)
@@ -132,6 +143,9 @@ func Load() *Config {
 		SSHUser:         getEnv("VM_SSH_USER", "azureuser"),
 		SSHPort:         getEnv("VM_SSH_PORT", "22"),
 
+		FLOutputStateDir: getEnv("FL_OUTPUT_STATE_DIR", filepath.Join(root, "state", "fl-owner")),
+		VMRegistryToken:  os.Getenv("VM_REGISTRY_TOKEN"),
+
 		DryRunVMs: dryRunVMs,
 
 		VMCredentialClaimTTL: getEnvDuration("VM_CREDENTIAL_CLAIM_TTL", 30*time.Minute),
@@ -140,8 +154,9 @@ func Load() *Config {
 	}
 }
 
-// ParseDryRunVMs parses DRY_RUN_VMS ("user=<host>,data-provider=<host>") into a
-// role -> host map. Empty input means dry-run is off.
+// ParseDryRunVMs parses DRY_RUN_VMS ("user=<host>,data-provider=<host>",
+// plus optional "vm:<VM Name>=<host>" entries) into a key -> host map, keyed
+// by role or "vm:<VM Name>". Empty input means dry-run is off.
 func ParseDryRunVMs(raw string) (map[string]string, error) {
 	out := map[string]string{}
 	if strings.TrimSpace(raw) == "" {
@@ -153,8 +168,12 @@ func ParseDryRunVMs(raw string) (map[string]string, error) {
 		if !ok || role == "" || host == "" {
 			return nil, fmt.Errorf("malformed entry %q (want role=host)", strings.TrimSpace(entry))
 		}
-		if role != "user" && role != "data-provider" {
-			return nil, fmt.Errorf("unknown role %q (want user or data-provider)", role)
+		if name, isVM := strings.CutPrefix(role, "vm:"); isVM {
+			if strings.TrimSpace(name) == "" {
+				return nil, fmt.Errorf("malformed entry %q (want vm:<VM Name>=host)", strings.TrimSpace(entry))
+			}
+		} else if role != "user" && role != "data-provider" {
+			return nil, fmt.Errorf("unknown role %q (want user, data-provider or vm:<VM Name>)", role)
 		}
 		out[role] = host
 	}

@@ -252,3 +252,28 @@ func TestAutoCreateCredentialChecks(t *testing.T) {
 		t.Fatalf("missing vm name: %d %v", rec.Code, out)
 	}
 }
+
+func TestCollectFLOutputRoute(t *testing.T) {
+	s := newTestServer(t, internalKey)
+	h := s.Handler()
+	path := "/p3dx/fl-output/sub-1/collect"
+
+	rec, out := do(t, h, http.MethodPost, path, nil, nil)
+	if rec.Code != http.StatusUnauthorized || out["error"] != "MISSING_AUTH_TOKEN" {
+		t.Fatalf("no token: %d %v", rec.Code, out)
+	}
+	vm := mint(t, jwt.MapClaims{"preferred_username": "alice", "azp": "flotilla-vm"})
+	rec, _ = do(t, h, http.MethodPost, path, map[string]string{"Authorization": "Bearer " + vm}, nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("VM token: %d", rec.Code)
+	}
+
+	user := mint(t, jwt.MapClaims{"preferred_username": "alice", "azp": "p3dx-auth-ui"})
+	rec, out = do(t, h, http.MethodPost, path, map[string]string{"Authorization": "Bearer " + user, "Origin": "http://ui"}, nil)
+	if rec.Code != http.StatusAccepted || (out["status"] != "collecting" && out["status"] != "already_collecting") {
+		t.Fatalf("user: %d %v", rec.Code, out)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != "http://ui" {
+		t.Fatalf("CORS header = %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}

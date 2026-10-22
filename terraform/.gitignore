@@ -1,5 +1,8 @@
 .terraform/
 .terraform.lock.hcl
+# participant-vm pins its providers: one lock file shared by real and dry runs
+# (also keeps concurrent runs from re-installing into the shared plugin cache).
+!participant-vm/.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 terraform.tfvars

@@ -7,3 +7,4 @@
 *.tfstate.*
 terraform.tfvars
 crash.log
+.env.bak*

@@ -74,6 +74,8 @@ func fakeSSH(dir string, args []string) int {
 		g, _ := os.OpenFile(filepath.Join(dir, "installs.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		fmt.Fprintf(g, "%s\n", b)
 		g.Close()
+	case remote == "stream-test":
+		os.Stdout.Write([]byte("streamed\x00bytes"))
 	case strings.Contains(remote, "docker inspect"):
 		fmt.Println("healthy")
 	case strings.Contains(remote, "docker compose"):
@@ -416,5 +418,27 @@ func TestHome(t *testing.T) {
 	r.cfg.VMFlotillaDir = "/opt/flotilla"
 	if r.home("") != "/opt/flotilla" {
 		t.Fatal(r.home(""))
+	}
+}
+
+func TestSSHStream(t *testing.T) {
+	dir := setupFakeSSH(t)
+	tg := SSHTarget{Host: "10.0.0.5", User: "azureuser", KeyPath: "/k/id", KnownHosts: "/k/kh"}
+	var buf strings.Builder
+	if err := tg.Stream("stream-test", &buf); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if buf.String() != "streamed\x00bytes" {
+		t.Fatalf("stdout = %q", buf.String())
+	}
+	calls := readJSONL[sshCall](t, filepath.Join(dir, "calls.jsonl"))
+	if len(calls) != 1 || !strings.Contains(strings.Join(calls[0].Argv, " "), "-i /k/id -o IdentitiesOnly=yes") {
+		t.Fatalf("argv = %v", calls)
+	}
+
+	_ = os.WriteFile(filepath.Join(dir, "fail"), nil, 0o600)
+	err := tg.Stream("stream-test", io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "remote command failed") {
+		t.Fatalf("want stderr in error, got %v", err)
 	}
 }
