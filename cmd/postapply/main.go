@@ -22,6 +22,7 @@ import (
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmcred"
@@ -34,6 +35,7 @@ import (
 func followSession(cfg *config.Config, tokens *keycloak.TokenSource, submission, ip, caPEM string, expect int, wait time.Duration) {
 	store := vmsession.NewStore()
 	flow := flauto.NewManager(store, tokens.Token, cfg.GatewayRESTPort)
+	flow.SetFLConfigSource(govclient.New(cfg.GovLayerURL, tokens.Token))
 	runToken := store.CreateToken("postapply", "user")
 	if err := flow.SetGatewayCA(submission, caPEM); err != nil {
 		log.Fatal(err)

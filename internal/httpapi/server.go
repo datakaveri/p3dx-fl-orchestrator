@@ -21,6 +21,7 @@ import (
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/provisioning"
@@ -48,6 +49,9 @@ func New(cfg *config.Config) *Server {
 		SSHUser: cfg.SSHUser, SSHPort: cfg.SSHPort,
 		StateDir: cfg.FLOutputStateDir, VMRegistryToken: cfg.VMRegistryToken,
 	})
+	// Sessions run with their contract's fl_config; an unreadable contract or
+	// a missing/out-of-range fl_config blocks the session.
+	flow.SetFLConfigSource(govclient.New(cfg.GovLayerURL, tokens.Token))
 	creds := vmcred.NewStore(cfg.VMCredentialClaimTTL)
 	prov := provisioning.New(cfg, store, flow, creds, postapply.New(cfg, tokens))
 	return &Server{cfg: cfg, store: store, flow: flow, prov: prov, creds: creds}

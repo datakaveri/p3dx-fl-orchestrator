@@ -1,6 +1,7 @@
 package flauto
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
 
@@ -151,6 +153,7 @@ func TestStartSessionPostsExecuteCommand(t *testing.T) {
 	store := vmsession.NewStore()
 	runTok := store.CreateToken("owner", "user")
 	m := NewManager(store, staticToken("svc-token"), g.port)
+	m.SetFLConfigSource(&stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 3, LocalEpochs: 1, LearningRate: 0.001, BatchSize: 32}})
 	_ = m.SetGatewayCA("sub/1", g.caPEM())
 	m.RegisterOwnerVM("sub/1", "127.0.0.1", runTok) // no expected count: no poller
 	s := m.getOrCreate("sub/1")
@@ -180,6 +183,110 @@ func TestStartSessionPostsExecuteCommand(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("no FL session done event")
+}
+
+type stubFLConfig struct {
+	fl  *govclient.FLRunConfig
+	err error
+	ids []string
+}
+
+func (s *stubFLConfig) LatestFLConfig(_ context.Context, id string) (*govclient.FLRunConfig, error) {
+	s.ids = append(s.ids, id)
+	return s.fl, s.err
+}
+
+// startWithFLConfig runs startSession against a stub gateway with src as the
+// contract's fl_config source.
+func startWithFLConfig(t *testing.T, src FLConfigSource) (*gateway, *vmsession.Store, string) {
+	g := newGateway(t)
+	store := vmsession.NewStore()
+	runTok := store.CreateToken("owner", "user")
+	m := NewManager(store, staticToken("svc-token"), g.port)
+	m.SetFLConfigSource(src)
+	_ = m.SetGatewayCA("sub-1", g.caPEM())
+	m.RegisterOwnerVM("sub-1", "127.0.0.1", runTok)
+	m.startSession("sub-1", m.getOrCreate("sub-1"))
+	return g, store, runTok
+}
+
+func execConfig(t *testing.T, g *gateway) map[string]any {
+	select {
+	case <-g.execDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("execute_command not called")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.execBody["federated_learning_config"].(map[string]any)
+}
+
+func TestStartSessionUsesContractFLConfig(t *testing.T) {
+	src := &stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 3, LocalEpochs: 2, LearningRate: 0.001, BatchSize: 16}}
+	g, store, runTok := startWithFLConfig(t, src)
+	cfg := execConfig(t, g)
+	if len(src.ids) != 1 || src.ids[0] != "sub-1" {
+		t.Fatalf("fl_config fetched for %v", src.ids)
+	}
+	session := cfg["session_config"].(map[string]any)
+	bench := cfg["benchmark_config"].(map[string]any)
+	client := cfg["client_training_config"].(map[string]any)
+	for name, c := range map[string][2]any{
+		"max_rounds":              {session["termination_condition_args"].(map[string]any)["max_rounds"], 3.0},
+		"epochs":                  {client["epochs"], 2.0},
+		"client learning_rate":    {client["learning_rate"], 0.001},
+		"benchmark learning_rate": {bench["learning_rate"], 0.001},
+		"client batch_size":       {client["batch_size"], 16.0},
+		"benchmark batch_size":    {bench["batch_size"], 16.0},
+		"train_timeout":           {client["train_timeout_duration_s"], 300.0},
+	} {
+		if c[0] != c[1] {
+			t.Errorf("%s = %v, want %v", name, c[0], c[1])
+		}
+	}
+	snap, _ := store.Get(runTok)
+	found := false
+	for _, e := range snap.Events {
+		if e.Step == "Starting FL session" && e.Status == "ok" {
+			found = strings.Contains(e.Message, "3 rounds, 2 local epochs, lr 0.001, batch 16")
+		}
+	}
+	if !found {
+		t.Fatalf("started event lacks the FL settings: %+v", snap.Events)
+	}
+}
+
+func TestStartSessionFLConfigErrorDoesNotStart(t *testing.T) {
+	for name, src := range map[string]FLConfigSource{
+		"no source":    nil,
+		"no fl_config": &stubFLConfig{},
+		"fetch error":  &stubFLConfig{err: testErr("gov_layer contract returned 500")},
+		"out of range": &stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 500, LocalEpochs: 2, LearningRate: 0.001, BatchSize: 16}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g, store, runTok := startWithFLConfig(t, src)
+			snap, _ := store.Get(runTok)
+			var errEvent bool
+			for _, e := range snap.Events {
+				if e.Step == "FL session" && e.Status == "error" {
+					errEvent = true
+				}
+				if e.Step == "Starting FL session" && e.Status == "ok" {
+					t.Fatalf("session reported started: %+v", e)
+				}
+			}
+			if !errEvent {
+				t.Fatalf("no FL session error event: %+v", snap.Events)
+			}
+			// startSession returned without spawning the execute_command request.
+			time.Sleep(100 * time.Millisecond)
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if g.execBody != nil || len(g.auths) != 0 {
+				t.Fatalf("gateway was called: %v %v", g.execBody, g.auths)
+			}
+		})
+	}
 }
 
 func TestWaitOwnerIP(t *testing.T) {

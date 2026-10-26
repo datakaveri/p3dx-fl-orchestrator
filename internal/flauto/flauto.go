@@ -20,6 +20,7 @@ package flauto
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -30,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
@@ -38,9 +40,16 @@ import (
 // session gateway's REST API accepts only that token, over TLS.
 type TokenFunc func() (string, error)
 
+// FLConfigSource supplies the training settings of a submission's signed
+// contract (govclient.Client; stubbed in tests).
+type FLConfigSource interface {
+	LatestFLConfig(ctx context.Context, submissionID string) (*govclient.FLRunConfig, error)
+}
+
 const (
-	pollInterval = 5 * time.Second
-	maxWait      = 2 * time.Hour // give up after 2h of not everyone connecting
+	pollInterval    = 5 * time.Second
+	maxWait         = 2 * time.Hour // give up after 2h of not everyone connecting
+	flConfigTimeout = 15 * time.Second
 )
 
 var nonAlnum = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
@@ -64,6 +73,7 @@ type Manager struct {
 	store    *vmsession.Store
 	token    TokenFunc
 	restPort int
+	flConfig FLConfigSource // required: startSession refuses to run without one
 
 	mu          sync.Mutex
 	submissions map[string]*submissionState
@@ -86,6 +96,10 @@ func NewManager(store *vmsession.Store, token TokenFunc, restPort int) *Manager 
 		submissions: make(map[string]*submissionState),
 	}
 }
+
+// SetFLConfigSource sets where startSession reads each session's contract
+// fl_config from.
+func (m *Manager) SetFLConfigSource(src FLConfigSource) { m.flConfig = src }
 
 // client returns an HTTPS client that trusts only this session gateway's CA.
 // The gateway certificate names the server VM's IP, so the URL uses the IP.
@@ -318,9 +332,18 @@ func (m *Manager) clientCount(s *submissionState, ownerIP string) (int, error) {
 func (m *Manager) startSession(submissionID string, s *submissionState) {
 	m.emit(s, "Starting FL session", "running", "All expected providers connected — starting training")
 
+	// A config flo_server cannot run would be retried forever, so a contract
+	// we cannot read or whose fl_config is out of range stops here.
+	fl, flCfg, err := m.sessionFLConfig(submissionID)
+	if err != nil {
+		m.emit(s, "FL session", "error", "Cannot start the FL session: "+err.Error())
+		log.Printf("[flauto] submission %s: FL session not started: %v", submissionID, err)
+		return
+	}
+
 	sessionID := nonAlnum.ReplaceAllString(submissionID, "_")
 	body := map[string]any{
-		"federated_learning_config": flotillaQuicksetupConfig,
+		"federated_learning_config": flCfg,
 		"session_id":                sessionID,
 		"file":                      false,
 		"restore":                   false,
@@ -376,6 +399,27 @@ func (m *Manager) startSession(submissionID string, s *submissionState) {
 		}()
 	}()
 
-	m.emit(s, "Starting FL session", "ok", fmt.Sprintf("Session %s started — training is now running on the server VM", sessionID))
+	m.emit(s, "Starting FL session", "ok", fmt.Sprintf(
+		"Session %s started — training is now running on the server VM — %d rounds, %d local epochs, lr %g, batch %d",
+		sessionID, fl.NumRounds, fl.LocalEpochs, fl.LearningRate, fl.BatchSize))
 	log.Printf("[flauto] submission %s: FL session %s started on %s", submissionID, sessionID, ownerIP)
+}
+
+// sessionFLConfig fetches the submission's contract fl_config and builds the
+// federated_learning_config from it.
+func (m *Manager) sessionFLConfig(submissionID string) (*govclient.FLRunConfig, map[string]any, error) {
+	if m.flConfig == nil {
+		return nil, nil, fmt.Errorf("no gov_layer configured to read the contract's FL settings from")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), flConfigTimeout)
+	defer cancel()
+	fl, err := m.flConfig.LatestFLConfig(ctx, submissionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the contract's FL settings: %w", err)
+	}
+	cfg, err := sessionConfigFor(fl)
+	if err != nil {
+		return nil, nil, err
+	}
+	return fl, cfg, nil
 }
