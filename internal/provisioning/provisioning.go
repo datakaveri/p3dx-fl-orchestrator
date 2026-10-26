@@ -499,7 +499,8 @@ func (p *Provisioner) runPostApply(in RunAutoProvisionInput, target postapply.SS
 		if err != nil {
 			return err
 		}
-		if err := p.flow.SetGatewayCA(in.SubmissionID, cert.CAPEM); err != nil {
+		if err := p.flow.SetGatewayCA(in.SubmissionID, cert.CAPEM,
+			flauto.ContractPin{ProjectID: cert.ProjectID, ContractID: cert.ContractID}); err != nil {
 			return err
 		}
 		// Keep this server VM's SSH key past the run's temp dir, so the FL

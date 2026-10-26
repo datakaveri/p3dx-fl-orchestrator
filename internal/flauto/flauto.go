@@ -40,10 +40,17 @@ import (
 // session gateway's REST API accepts only that token, over TLS.
 type TokenFunc func() (string, error)
 
-// FLConfigSource supplies the training settings of a submission's signed
-// contract (govclient.Client; stubbed in tests).
+// FLConfigSource reads the signed contract a session is pinned to
+// (govclient.Client; stubbed in tests).
 type FLConfigSource interface {
-	LatestFLConfig(ctx context.Context, submissionID string) (*govclient.FLRunConfig, error)
+	ContractByProject(ctx context.Context, projectID string) (*govclient.Contract, error)
+}
+
+// ContractPin names the one contract a session runs under: the contract
+// gov_layer issued the session gateway's certificate for (/gateway-certs).
+type ContractPin struct {
+	ProjectID  string
+	ContractID string
 }
 
 const (
@@ -61,6 +68,7 @@ type submissionState struct {
 	tokens                map[string]struct{}
 	gatewayCA             *x509.CertPool // the session gateway's CA (gov_layer's governance CA)
 	gatewayCAPEM          string
+	contract              ContractPin    // set with the gateway CA; the contract startSession reads
 	ownerReady            chan struct{}  // closed once ownerIP is set
 	lastConnectedCount    int
 	started               bool
@@ -133,17 +141,18 @@ func (m *Manager) gatewayRequest(method, url string, body []byte) (*http.Request
 	return req, nil
 }
 
-// SetGatewayCA records the CA the session gateway's certificate chains to
-// (from gov_layer's /gateway-certs response); flauto will not talk to the
-// gateway before it is set.
-func (m *Manager) SetGatewayCA(submissionID, caPEM string) error {
+// SetGatewayCA records, from gov_layer's /gateway-certs response, the CA the
+// session gateway's certificate chains to and the contract it was issued
+// for; flauto will not talk to the gateway before it is set, and starts the
+// session only under that pinned contract.
+func (m *Manager) SetGatewayCA(submissionID, caPEM string, pin ContractPin) error {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM([]byte(caPEM)) {
 		return fmt.Errorf("invalid gateway CA PEM")
 	}
 	s := m.getOrCreate(submissionID)
 	s.mu.Lock()
-	s.gatewayCA, s.gatewayCAPEM = pool, caPEM
+	s.gatewayCA, s.gatewayCAPEM, s.contract = pool, caPEM, pin
 	s.mu.Unlock()
 	return nil
 }
@@ -334,7 +343,7 @@ func (m *Manager) startSession(submissionID string, s *submissionState) {
 
 	// A config flo_server cannot run would be retried forever, so a contract
 	// we cannot read or whose fl_config is out of range stops here.
-	fl, flCfg, err := m.sessionFLConfig(submissionID)
+	fl, flCfg, err := m.sessionFLConfig(submissionID, s)
 	if err != nil {
 		m.emit(s, "FL session", "error", "Cannot start the FL session: "+err.Error())
 		log.Printf("[flauto] submission %s: FL session not started: %v", submissionID, err)
@@ -405,18 +414,34 @@ func (m *Manager) startSession(submissionID string, s *submissionState) {
 	log.Printf("[flauto] submission %s: FL session %s started on %s", submissionID, sessionID, ownerIP)
 }
 
-// sessionFLConfig fetches the submission's contract fl_config and builds the
-// federated_learning_config from it.
-func (m *Manager) sessionFLConfig(submissionID string) (*govclient.FLRunConfig, map[string]any, error) {
+// sessionFLConfig fetches the fl_config of the contract the session is
+// pinned to (s.contract) and builds the federated_learning_config from it.
+// It checks gov_layer returned that very contract, for this submission.
+func (m *Manager) sessionFLConfig(submissionID string, s *submissionState) (*govclient.FLRunConfig, map[string]any, error) {
 	if m.flConfig == nil {
 		return nil, nil, fmt.Errorf("no gov_layer configured to read the contract's FL settings from")
 	}
+	s.mu.Lock()
+	pin := s.contract
+	s.mu.Unlock()
+	if pin.ProjectID == "" {
+		return nil, nil, fmt.Errorf("no contract pinned for this session (the gateway certificate names it)")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), flConfigTimeout)
 	defer cancel()
-	fl, err := m.flConfig.LatestFLConfig(ctx, submissionID)
+	c, err := m.flConfig.ContractByProject(ctx, pin.ProjectID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read the contract's FL settings: %w", err)
 	}
+	switch {
+	case c.ProjectID != pin.ProjectID:
+		return nil, nil, fmt.Errorf("gov_layer returned project %s, not the pinned %s", c.ProjectID, pin.ProjectID)
+	case pin.ContractID != "" && c.ContractID != pin.ContractID:
+		return nil, nil, fmt.Errorf("project %s holds contract %s, not the gateway certificate's %s", pin.ProjectID, c.ContractID, pin.ContractID)
+	case c.SessionInfo.SessionID != submissionID:
+		return nil, nil, fmt.Errorf("contract %s belongs to submission %s, not %s", c.ContractID, c.SessionInfo.SessionID, submissionID)
+	}
+	fl := c.FLConfig
 	cfg, err := sessionConfigFor(fl)
 	if err != nil {
 		return nil, nil, err

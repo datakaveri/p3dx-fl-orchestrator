@@ -83,7 +83,7 @@ func staticToken(tok string) TokenFunc { return func() (string, error) { return 
 func TestClientCountOverTLSWithBearer(t *testing.T) {
 	g := newGateway(t)
 	m := NewManager(vmsession.NewStore(), staticToken("svc-token"), g.port)
-	if err := m.SetGatewayCA("sub-1", g.caPEM()); err != nil {
+	if err := m.SetGatewayCA("sub-1", g.caPEM(), testPin); err != nil {
 		t.Fatal(err)
 	}
 	m.RegisterOwnerVM("sub-1", "127.0.0.1", "")
@@ -105,7 +105,7 @@ func TestClientCountRejectsUntrustedGateway(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			m := NewManager(vmsession.NewStore(), staticToken("svc-token"), g.port)
 			if ca != "" {
-				if err := m.SetGatewayCA("sub-1", ca); err != nil {
+				if err := m.SetGatewayCA("sub-1", ca, testPin); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -126,7 +126,7 @@ func TestClientCountRejectsUntrustedGateway(t *testing.T) {
 func TestClientCountTokenError(t *testing.T) {
 	g := newGateway(t)
 	m := NewManager(vmsession.NewStore(), func() (string, error) { return "", errTest }, g.port)
-	_ = m.SetGatewayCA("sub-1", g.caPEM())
+	_ = m.SetGatewayCA("sub-1", g.caPEM(), testPin)
 	if _, err := m.clientCount(m.getOrCreate("sub-1"), "127.0.0.1"); err != errTest {
 		t.Fatalf("want token error, got %v", err)
 	}
@@ -143,7 +143,7 @@ const errTest = testErr("no token")
 
 func TestSetGatewayCAInvalid(t *testing.T) {
 	m := NewManager(vmsession.NewStore(), staticToken("x"), 1)
-	if err := m.SetGatewayCA("s", "not a pem"); err == nil {
+	if err := m.SetGatewayCA("s", "not a pem", testPin); err == nil {
 		t.Fatal("want error for invalid PEM")
 	}
 }
@@ -153,8 +153,8 @@ func TestStartSessionPostsExecuteCommand(t *testing.T) {
 	store := vmsession.NewStore()
 	runTok := store.CreateToken("owner", "user")
 	m := NewManager(store, staticToken("svc-token"), g.port)
-	m.SetFLConfigSource(&stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 3, LocalEpochs: 1, LearningRate: 0.001, BatchSize: 32}})
-	_ = m.SetGatewayCA("sub/1", g.caPEM())
+	m.SetFLConfigSource(&stubFLConfig{session: "sub/1", fl: &govclient.FLRunConfig{NumRounds: 3, LocalEpochs: 1, LearningRate: 0.001, BatchSize: 32}})
+	_ = m.SetGatewayCA("sub/1", g.caPEM(), testPin)
 	m.RegisterOwnerVM("sub/1", "127.0.0.1", runTok) // no expected count: no poller
 	s := m.getOrCreate("sub/1")
 	m.startSession("sub/1", s)
@@ -185,26 +185,48 @@ func TestStartSessionPostsExecuteCommand(t *testing.T) {
 	t.Fatal("no FL session done event")
 }
 
+// testPin is the contract the tests' gateway certificates are issued for.
+var testPin = ContractPin{ProjectID: "proj-1", ContractID: "c-1"}
+
+// stubFLConfig serves the pinned project's contract: testPin's contract id
+// for submission "sub-1" (or session), unless contractID overrides it.
 type stubFLConfig struct {
-	fl  *govclient.FLRunConfig
-	err error
-	ids []string
+	fl         *govclient.FLRunConfig
+	err        error
+	session    string
+	contractID string
+	ids        []string
 }
 
-func (s *stubFLConfig) LatestFLConfig(_ context.Context, id string) (*govclient.FLRunConfig, error) {
+func (s *stubFLConfig) ContractByProject(_ context.Context, id string) (*govclient.Contract, error) {
 	s.ids = append(s.ids, id)
-	return s.fl, s.err
+	if s.err != nil {
+		return nil, s.err
+	}
+	c := &govclient.Contract{ProjectID: id, ContractID: testPin.ContractID, FLConfig: s.fl}
+	if s.contractID != "" {
+		c.ContractID = s.contractID
+	}
+	c.SessionInfo.SessionID = "sub-1"
+	if s.session != "" {
+		c.SessionInfo.SessionID = s.session
+	}
+	return c, nil
 }
 
 // startWithFLConfig runs startSession against a stub gateway with src as the
-// contract's fl_config source.
+// contract's fl_config source, under the contract pin.
 func startWithFLConfig(t *testing.T, src FLConfigSource) (*gateway, *vmsession.Store, string) {
+	return startPinned(t, src, testPin)
+}
+
+func startPinned(t *testing.T, src FLConfigSource, pin ContractPin) (*gateway, *vmsession.Store, string) {
 	g := newGateway(t)
 	store := vmsession.NewStore()
 	runTok := store.CreateToken("owner", "user")
 	m := NewManager(store, staticToken("svc-token"), g.port)
 	m.SetFLConfigSource(src)
-	_ = m.SetGatewayCA("sub-1", g.caPEM())
+	_ = m.SetGatewayCA("sub-1", g.caPEM(), pin)
 	m.RegisterOwnerVM("sub-1", "127.0.0.1", runTok)
 	m.startSession("sub-1", m.getOrCreate("sub-1"))
 	return g, store, runTok
@@ -225,8 +247,8 @@ func TestStartSessionUsesContractFLConfig(t *testing.T) {
 	src := &stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 3, LocalEpochs: 2, LearningRate: 0.001, BatchSize: 16}}
 	g, store, runTok := startWithFLConfig(t, src)
 	cfg := execConfig(t, g)
-	if len(src.ids) != 1 || src.ids[0] != "sub-1" {
-		t.Fatalf("fl_config fetched for %v", src.ids)
+	if len(src.ids) != 1 || src.ids[0] != "proj-1" {
+		t.Fatalf("contract fetched for projects %v, want the pinned proj-1", src.ids)
 	}
 	session := cfg["session_config"].(map[string]any)
 	bench := cfg["benchmark_config"].(map[string]any)
@@ -257,14 +279,21 @@ func TestStartSessionUsesContractFLConfig(t *testing.T) {
 }
 
 func TestStartSessionFLConfigErrorDoesNotStart(t *testing.T) {
-	for name, src := range map[string]FLConfigSource{
-		"no source":    nil,
-		"no fl_config": &stubFLConfig{},
-		"fetch error":  &stubFLConfig{err: testErr("gov_layer contract returned 500")},
-		"out of range": &stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 500, LocalEpochs: 2, LearningRate: 0.001, BatchSize: 16}},
+	ok := &govclient.FLRunConfig{NumRounds: 3, LocalEpochs: 2, LearningRate: 0.001, BatchSize: 16}
+	for name, tc := range map[string]struct {
+		src FLConfigSource
+		pin ContractPin
+	}{
+		"no source":          {nil, testPin},
+		"no fl_config":       {&stubFLConfig{}, testPin},
+		"fetch error":        {&stubFLConfig{err: testErr("gov_layer contract returned 500")}, testPin},
+		"out of range":       {&stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 500, LocalEpochs: 2, LearningRate: 0.001, BatchSize: 16}}, testPin},
+		"no pinned contract": {&stubFLConfig{fl: ok}, ContractPin{}},
+		"different contract": {&stubFLConfig{fl: ok, contractID: "c-restart"}, testPin},
+		"another submission": {&stubFLConfig{fl: ok, session: "sub-2"}, testPin},
 	} {
 		t.Run(name, func(t *testing.T) {
-			g, store, runTok := startWithFLConfig(t, src)
+			g, store, runTok := startPinned(t, tc.src, tc.pin)
 			snap, _ := store.Get(runTok)
 			var errEvent bool
 			for _, e := range snap.Events {
@@ -300,7 +329,7 @@ func TestWaitOwnerIP(t *testing.T) {
 	}
 
 	ca := otherCAPEM(t)
-	if err := m.SetGatewayCA("sub-1", ca); err != nil {
+	if err := m.SetGatewayCA("sub-1", ca, testPin); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})

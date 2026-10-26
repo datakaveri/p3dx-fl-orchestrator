@@ -42,18 +42,27 @@ func New(baseURL string, token TokenFunc) *Client {
 	}
 }
 
-// LatestFLConfig returns the fl_config of the latest contract for this
-// submission (GET /contract/{submissionID}), or nil, nil when that contract
-// has none (sessionConfigFor rejects that). A missing contract (404) is an
-// error: we only ask right before
-// starting the submission's session, so there must be one.
-func (c *Client) LatestFLConfig(ctx context.Context, submissionID string) (*FLRunConfig, error) {
+// Contract is the part of a signed contract the orchestrator acts on.
+type Contract struct {
+	ProjectID   string `json:"project_id"`
+	ContractID  string `json:"contract_id"`
+	SessionInfo struct {
+		SessionID string `json:"session_id"`
+	} `json:"session_info"`
+	FLConfig *FLRunConfig `json:"fl_config"` // nil when the contract has none
+}
+
+// ContractByProject returns the contract stored for one project
+// (GET /contracts/by-project/{projectID}) — the exact contract a session's
+// gateway certificate was issued for, never "the submission's latest", which
+// a restart can replace. A missing contract (404) is an error.
+func (c *Client) ContractByProject(ctx context.Context, projectID string) (*Contract, error) {
 	tok, err := c.token()
 	if err != nil {
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		c.baseURL+"/contract/"+url.PathEscape(submissionID), nil)
+		c.baseURL+"/contracts/by-project/"+url.PathEscape(projectID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -65,16 +74,14 @@ func (c *Client) LatestFLConfig(ctx context.Context, submissionID string) (*FLRu
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("gov_layer has no contract for submission %s", submissionID)
+		return nil, fmt.Errorf("gov_layer has no contract for project %s", projectID)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("gov_layer contract returned %d", resp.StatusCode)
 	}
 	var body struct {
-		Status   string `json:"status"`
-		Contract *struct {
-			FLConfig *FLRunConfig `json:"fl_config"`
-		} `json:"contract"`
+		Status   string    `json:"status"`
+		Contract *Contract `json:"contract"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, fmt.Errorf("gov_layer contract: %w", err)
@@ -82,5 +89,5 @@ func (c *Client) LatestFLConfig(ctx context.Context, submissionID string) (*FLRu
 	if body.Status != "SUCCESS" || body.Contract == nil {
 		return nil, fmt.Errorf("gov_layer contract: unexpected response (status %q)", body.Status)
 	}
-	return body.Contract.FLConfig, nil
+	return body.Contract, nil
 }
