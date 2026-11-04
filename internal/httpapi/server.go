@@ -14,6 +14,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +24,7 @@ import (
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/provisioning"
@@ -37,10 +41,26 @@ type Server struct {
 	flow  *flauto.Manager
 	prov  *provisioning.Provisioner
 	creds *vmcred.Store
+	gov   ContractSource
+}
+
+// ContractSource reads a submission's contract parties from gov_layer
+// (*govclient.Client); a stub in tests.
+type ContractSource interface {
+	ContractParties(ctx context.Context, submissionID string) (*govclient.Parties, error)
 }
 
 func New(cfg *config.Config) *Server {
+	// Runs live on disk so their panels can be reopened after a restart.
 	store := vmsession.NewStore()
+	if cfg.FLOutputStateDir != "" {
+		var err error
+		store, err = vmsession.NewPersistentStore(filepath.Join(cfg.FLOutputStateDir, "runs"), cfg.RunRetention)
+		if err != nil {
+			log.Fatalf("[fl-orchestrator] provisioning run store: %v", err)
+		}
+		keepOutOfGit(cfg.FLOutputStateDir)
+	}
 	tokens := keycloak.NewTokenSource(cfg.KeycloakBaseURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret)
 	flow := flauto.NewManager(store, tokens.Token, cfg.GatewayRESTPort)
 	flow.ConfigureOutput(flauto.OutputConfig{
@@ -48,9 +68,18 @@ func New(cfg *config.Config) *Server {
 		SSHUser: cfg.SSHUser, SSHPort: cfg.SSHPort,
 		StateDir: cfg.FLOutputStateDir, VMRegistryToken: cfg.VMRegistryToken,
 	})
+	// Sessions run with their contract's fl_config; an unreadable contract or
+	// a missing/out-of-range fl_config blocks the session.
+	gov := govclient.New(cfg.GovLayerURL, tokens.Token)
+	flow.SetFLConfigSource(gov)
+	// Runs reloaded from disk keep receiving their submission's FL events
+	// (training rounds, session finished, output collected).
+	for token, submissionID := range store.Resumable() {
+		flow.RegisterProviderToken(submissionID, token)
+	}
 	creds := vmcred.NewStore(cfg.VMCredentialClaimTTL)
 	prov := provisioning.New(cfg, store, flow, creds, postapply.New(cfg, tokens))
-	return &Server{cfg: cfg, store: store, flow: flow, prov: prov, creds: creds}
+	return &Server{cfg: cfg, store: store, flow: flow, prov: prov, creds: creds, gov: gov}
 }
 
 // Handler returns the root http.Handler.
@@ -67,6 +96,7 @@ func (s *Server) registerRoutes(r chi.Router) {
 		r.Post("/vm-provisioning/auto-create", s.postAutoCreate)
 		r.Get("/vm-provisioning/private-key", s.getPrivateKey)
 		r.Post("/vm-provisioning/token", s.postToken)
+		r.Get("/vm-provisioning/runs", s.getRuns)
 		r.Post("/fl-output/{submissionId}/collect", s.postCollectFLOutput)
 	})
 	// Token-authenticated (deploy.sh has no browser session / JWT) or
@@ -131,8 +161,34 @@ func (s *Server) requireJWT(next http.Handler) http.Handler {
 		}
 		username := keycloak.PreferredUsername(tok)
 		ctx := context.WithValue(r.Context(), usernameCtxKey{}, username)
+		if claims, ok := tok.Claims.(jwt.MapClaims); ok {
+			ctx = context.WithValue(ctx, rolesCtxKey{}, realmRoles(claims))
+		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+type rolesCtxKey struct{}
+
+// operatorRole is the realm role of the FL operator, who starts a session's
+// server VM from the FL Orchestrator page on the output owner's behalf.
+const operatorRole = "fl-orchestrator"
+
+func realmRoles(claims jwt.MapClaims) []string {
+	ra, _ := claims["realm_access"].(map[string]any)
+	list, _ := ra["roles"].([]any)
+	roles := make([]string, 0, len(list))
+	for _, v := range list {
+		if s, ok := v.(string); ok {
+			roles = append(roles, s)
+		}
+	}
+	return roles
+}
+
+func isOperator(r *http.Request) bool {
+	roles, _ := r.Context().Value(rolesCtxKey{}).([]string)
+	return slices.Contains(roles, operatorRole)
 }
 
 func usernameFromCtx(r *http.Request) string {
@@ -154,6 +210,15 @@ func (s *Server) requireInternalKey(next http.Handler) http.Handler {
 	})
 }
 
+// keepOutOfGit drops a "*" .gitignore into dir (the state dir may sit inside
+// the repo checkout), as flauto does for the owner-VM keys it keeps there.
+func keepOutOfGit(dir string) {
+	ignore := filepath.Join(dir, ".gitignore")
+	if _, err := os.Stat(ignore); os.IsNotExist(err) {
+		_ = os.WriteFile(ignore, []byte("*\n"), 0o600)
+	}
+}
+
 type j = map[string]any
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -172,4 +237,21 @@ func readBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// sessionParties loads the submission's contract parties for an
+// authorization check, writing the error response itself (404 no contract,
+// 502 gov_layer unreachable) and returning nil in that case.
+func (s *Server) sessionParties(w http.ResponseWriter, r *http.Request, submissionID string) *govclient.Parties {
+	parties, err := s.gov.ContractParties(r.Context(), submissionID)
+	if err == nil {
+		return parties
+	}
+	if errors.Is(err, govclient.ErrNoContract) {
+		writeJSON(w, http.StatusNotFound, j{"status": "FAILED", "error": "NO_CONTRACT"})
+		return nil
+	}
+	log.Printf("[fl-orchestrator] contract lookup for %s: %v", submissionID, err)
+	writeJSON(w, http.StatusBadGateway, j{"status": "FAILED", "error": "GOV_LAYER_UNAVAILABLE"})
+	return nil
 }

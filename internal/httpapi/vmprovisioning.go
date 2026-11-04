@@ -17,9 +17,11 @@ type autoCreateInput struct {
 	VMName       string `json:"vmName"`
 	RunKey       string `json:"runKey"`
 	SubmissionID string `json:"submissionId"`
-	// CredentialID names the VM credential p3dx-aaa handed over after the
+	// CredentialID names the VM credential the controlplane handed over after the
 	// provider authorized this VM; required for a data-provider VM.
 	CredentialID string `json:"credentialId"`
+	// An "outputOwnerUsername" body field is no longer read: the owner comes
+	// from the session's contract.
 }
 
 func normalizeRole(role string) string {
@@ -45,7 +47,9 @@ func (s *Server) postAutoCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	role := normalizeRole(in.Role)
 	vmName := strings.TrimSpace(in.VMName)
-	if vmName == "" {
+	// A submission's VM is named after the submission (provisioning.VMName),
+	// so only a run without one needs a client-chosen name.
+	if vmName == "" && in.SubmissionID == "" {
 		writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "MISSING_VM_NAME"})
 		return
 	}
@@ -55,6 +59,30 @@ func (s *Server) postAutoCreate(w http.ResponseWriter, r *http.Request) {
 	runKey := in.RunKey
 	if runKey == "" {
 		runKey = username
+	}
+
+	// Only the session's own parties may provision for it: the output owner
+	// the server VM, a contract data provider a client VM.
+	outputOwner := ""
+	if in.SubmissionID != "" {
+		parties := s.sessionParties(w, r, in.SubmissionID)
+		if parties == nil {
+			return
+		}
+		if role == "user" {
+			if !parties.IsOwner(username) && !isOperator(r) {
+				writeJSON(w, http.StatusForbidden, j{"status": "FAILED", "error": "NOT_SESSION_OWNER"})
+				return
+			}
+			outputOwner = parties.UserName
+		} else if !parties.IsDataProvider(username) {
+			writeJSON(w, http.StatusForbidden, j{"status": "FAILED", "error": "NOT_A_CONTRACT_PARTY"})
+			return
+		}
+	} else if role == "user" {
+		// A server VM exists to run one submission's session.
+		writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "MISSING_SUBMISSION_ID"})
+		return
 	}
 
 	if s.prov.IsProvisioning(runKey) {
@@ -76,7 +104,16 @@ func (s *Server) postAutoCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	token := s.store.CreateToken(username, role)
+	// "Start Again" reuses the submission id: a new server VM run must not
+	// inherit the finished earlier session's FL state.
+	if role == "user" && in.SubmissionID != "" {
+		s.flow.PrepareOwnerRun(in.SubmissionID)
+	}
+
+	token := s.store.CreateRun(vmsession.RunInfo{
+		Username: username, Role: role, SubmissionID: in.SubmissionID,
+		VMName: provisioning.VMName(in.SubmissionID, vmName, username), OutputOwner: outputOwner,
+	})
 	writeJSON(w, http.StatusAccepted, j{"status": "SUCCESS", "token": token})
 
 	go s.prov.RunAutoProvision(provisioning.RunAutoProvisionInput{
@@ -89,8 +126,14 @@ func (s *Server) postAutoCreate(w http.ResponseWriter, r *http.Request) {
 // private key generated for one specific auto-created VM run.
 func (s *Server) getPrivateKey(w http.ResponseWriter, r *http.Request) {
 	runToken := strings.TrimSpace(r.URL.Query().Get("token"))
+	// The run token is a capability, but also require it to be the caller's
+	// own run (or a server-VM run they own the output of).
+	if runToken == "" || !s.store.CanAccess(runToken, usernameFromCtx(r)) {
+		writeJSON(w, http.StatusNotFound, j{"status": "FAILED", "error": "NOT_FOUND_OR_ALREADY_DOWNLOADED"})
+		return
+	}
 	key, ok := s.prov.TakePrivateKey(runToken)
-	if runToken == "" || !ok {
+	if !ok {
 		writeJSON(w, http.StatusNotFound, j{"status": "FAILED", "error": "NOT_FOUND_OR_ALREADY_DOWNLOADED"})
 		return
 	}
@@ -147,21 +190,32 @@ func (s *Server) postEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, j{"status": "SUCCESS"})
 }
 
-// GET /p3dx/vm-provisioning/stream — SSE push of one run's VM provisioning
-// events. EventSource can't set an Authorization header, so this takes
-// identifying info as query params rather than a JWT. Prefer ?token=
-// (identifies one specific run unambiguously); ?username=&role= falls back
-// to "most recent run for this username+role", kept for the manual deploy.sh
-// flow which never has a token. Sends the full event log each time it
-// changes — traffic is tiny and short-lived, so no need to diff.
-func (s *Server) getStream(w http.ResponseWriter, r *http.Request) {
-	runToken := strings.TrimSpace(r.URL.Query().Get("token"))
-	username := strings.TrimSpace(r.URL.Query().Get("username"))
-	if runToken == "" && username == "" {
+// GET /p3dx/vm-provisioning/runs?submissionId= — the caller's runs, newest
+// first, so a panel can be reopened later (their own runs, plus server VM
+// runs whose output owner they are). Optionally narrowed to one submission.
+func (s *Server) getRuns(w http.ResponseWriter, r *http.Request) {
+	username := usernameFromCtx(r)
+	if username == "" {
 		writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "MISSING_USERNAME"})
 		return
 	}
-	role := normalizeRole(r.URL.Query().Get("role"))
+	submissionID := strings.TrimSpace(r.URL.Query().Get("submissionId"))
+	writeJSON(w, http.StatusOK, j{"runs": s.store.ListRuns(username, submissionID)})
+}
+
+// GET /p3dx/vm-provisioning/stream?token= — SSE push of one run's VM
+// provisioning events. EventSource can't set an Authorization header, so the
+// run token (an unguessable capability, listed only to its owner by
+// /vm-provisioning/runs) identifies the run instead of a JWT. The old
+// ?username=&role= lookup is gone: it let anyone watch anyone's latest run.
+// Sends the full event log each time the run changes — traffic is tiny, so
+// no need to diff.
+func (s *Server) getStream(w http.ResponseWriter, r *http.Request) {
+	runToken := strings.TrimSpace(r.URL.Query().Get("token"))
+	if runToken == "" {
+		writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "MISSING_TOKEN"})
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -175,24 +229,20 @@ func (s *Server) getStream(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "\n")
 	flusher.Flush()
 
-	lastCount := -1
+	// Rev, not len(Events): a "Training round" event is replaced in place.
+	sent, lastRev := false, uint64(0)
 	poll := func() {
-		snap, ok := vmsession.Snapshot{}, false
-		if runToken != "" {
-			snap, ok = s.store.Get(runToken)
-		} else {
-			snap, ok = s.store.GetLatestForUser(username, role)
-		}
+		snap, ok := s.store.Get(runToken)
 		status := snap.Status
 		if !ok || status == "" {
 			status = "idle"
 		}
-		if len(snap.Events) != lastCount {
+		if !sent || snap.Rev != lastRev {
 			payload := j{"status": status, "vmReady": snap.VMReady, "events": snap.Events}
 			data, _ := json.Marshal(payload)
 			fmt.Fprintf(w, "data: %s\n\n", data)
 			flusher.Flush()
-			lastCount = len(snap.Events)
+			sent, lastRev = true, snap.Rev
 		}
 	}
 
@@ -247,7 +297,7 @@ type vmCredentialInput struct {
 	ExpiresAt    string `json:"expires_at"`
 }
 
-// POST /p3dx/internal/vm-credentials — p3dx-aaa hands over a freshly issued
+// POST /p3dx/internal/vm-credentials — the controlplane hands over a freshly issued
 // VM credential (X-Internal-Key). Held in memory only until the provider's
 // provisioning run claims and delivers it; never logged.
 func (s *Server) postVMCredential(w http.ResponseWriter, r *http.Request) {
