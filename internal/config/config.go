@@ -54,7 +54,7 @@ type Config struct {
 
 	// The orchestrator's own Keycloak identity (client-credentials grant,
 	// realm role fl-orchestrator): used to request gateway certificates from
-	// gov_layer, to call the gateway's REST API, and for p3dx-aaa callbacks.
+	// gov_layer, to call the gateway's REST API, and for controlplane callbacks.
 	KeycloakClientID     string // KEYCLOAK_CLIENT_ID (default p3dx-fl-orchestrator)
 	KeycloakClientSecret string // KEYCLOAK_CLIENT_SECRET
 	// FlotillaVMClientID is the Keycloak client VM credentials are minted
@@ -62,8 +62,8 @@ type Config struct {
 	FlotillaVMClientID string // FLOTILLA_VM_CLIENT_ID (default flotilla-vm)
 
 	GovLayerURL  string // GOV_LAYER_URL (default http://localhost:8083/api/v1)
-	AAAURL       string // AAA_URL — p3dx-aaa as this service reaches it
-	AAAPublicURL string // AAA_PUBLIC_URL — p3dx-aaa as client VMs reach it (sidecar token refresh)
+	AAAURL       string // AAA_URL — the controlplane as this service reaches it
+	AAAPublicURL string // AAA_PUBLIC_URL — the controlplane as client VMs reach it (sidecar token refresh)
 
 	// Paths on the session VMs (cloud-init.sh.tftpl creates them).
 	GatewayDir      string // GATEWAY_DIR (default /etc/flotilla-gateway)
@@ -79,15 +79,21 @@ type Config struct {
 	// and IP, so FL output can be collected after the provisioning run's
 	// temp dir is wiped or the service restarts. Only the server VM's key.
 	FLOutputStateDir string
+	// RunRetention (VM_RUN_RETENTION, default 720h = 30 days) is how long a
+	// provisioning run stays listed/reopenable after its last change. Runs
+	// are kept under <FLOutputStateDir>/runs/, one JSON file per run token.
+	RunRetention time.Duration
 	// VMRegistryToken (VM_REGISTRY_TOKEN) is sent as X-VM-Registry-Token to
 	// gov_layer's /vm-registry/output-owner (restart fallback for the owner IP).
 	VMRegistryToken string
 
-	// DryRunVMs (DRY_RUN_VMS, "role=host,vm:<VM Name>=host,...") is a
-	// test-only mode: runs use these existing VMs instead of signing in to
-	// Azure and creating one. A "vm:<VM Name>" entry pins the run whose VM
-	// Name matches to that host (so several providers can each get their own
-	// VM); otherwise the run's role picks the host. Empty = normal runs.
+	// DryRunVMs (DRY_RUN_VMS, "role=host,user:<username>=host,vm:<VM Name>=host,...")
+	// is a test-only mode: runs use these existing VMs instead of signing in
+	// to Azure and creating one. A "user:<username>" entry pins the caller's
+	// run to that host — every VM of one submission now shares the name
+	// p3dx-fl-<id>, so the caller is what tells two providers apart; then a
+	// legacy "vm:<VM Name>" entry (runs without a submission); otherwise the
+	// run's role picks the host. Empty = normal runs.
 	DryRunVMs map[string]string
 
 	VMCredentialClaimTTL time.Duration // VM_CREDENTIAL_CLAIM_TTL (default 30m)
@@ -132,7 +138,7 @@ func Load() *Config {
 		FlotillaVMClientID:   getEnv("FLOTILLA_VM_CLIENT_ID", "flotilla-vm"),
 
 		GovLayerURL:  strings.TrimRight(getEnv("GOV_LAYER_URL", "http://localhost:8083/api/v1"), "/"),
-		AAAURL:       strings.TrimRight(getEnv("AAA_URL", "http://localhost:3001"), "/"),
+		AAAURL:       strings.TrimRight(getEnv("AAA_URL", "http://localhost:8443"), "/"),
 		AAAPublicURL: strings.TrimRight(os.Getenv("AAA_PUBLIC_URL"), "/"),
 
 		GatewayDir:      getEnv("GATEWAY_DIR", "/etc/flotilla-gateway"),
@@ -145,6 +151,7 @@ func Load() *Config {
 
 		FLOutputStateDir: getEnv("FL_OUTPUT_STATE_DIR", filepath.Join(root, "state", "fl-owner")),
 		VMRegistryToken:  os.Getenv("VM_REGISTRY_TOKEN"),
+		RunRetention:     getEnvDuration("VM_RUN_RETENTION", 30*24*time.Hour),
 
 		DryRunVMs: dryRunVMs,
 
@@ -155,8 +162,9 @@ func Load() *Config {
 }
 
 // ParseDryRunVMs parses DRY_RUN_VMS ("user=<host>,data-provider=<host>",
-// plus optional "vm:<VM Name>=<host>" entries) into a key -> host map, keyed
-// by role or "vm:<VM Name>". Empty input means dry-run is off.
+// plus optional "user:<username>=<host>" and "vm:<VM Name>=<host>" entries)
+// into a key -> host map, keyed by role, "user:<username>" or
+// "vm:<VM Name>". Empty input means dry-run is off.
 func ParseDryRunVMs(raw string) (map[string]string, error) {
 	out := map[string]string{}
 	if strings.TrimSpace(raw) == "" {
@@ -172,8 +180,12 @@ func ParseDryRunVMs(raw string) (map[string]string, error) {
 			if strings.TrimSpace(name) == "" {
 				return nil, fmt.Errorf("malformed entry %q (want vm:<VM Name>=host)", strings.TrimSpace(entry))
 			}
+		} else if name, isUser := strings.CutPrefix(role, "user:"); isUser {
+			if strings.TrimSpace(name) == "" {
+				return nil, fmt.Errorf("malformed entry %q (want user:<username>=host)", strings.TrimSpace(entry))
+			}
 		} else if role != "user" && role != "data-provider" {
-			return nil, fmt.Errorf("unknown role %q (want user, data-provider or vm:<VM Name>)", role)
+			return nil, fmt.Errorf("unknown role %q (want user, data-provider, user:<username> or vm:<VM Name>)", role)
 		}
 		out[role] = host
 	}

@@ -10,6 +10,8 @@ variable "existing_vm_ip" {
 # The VM already exists, so there is no admin_ssh_key to bake this run's
 # key in: append its public key to the VM user's authorized_keys using this
 # machine's own default SSH identity, so the SSH steps below work unchanged.
+# ConnectTimeout/ServerAlive*: an unreachable VM fails in seconds instead of
+# the ~2 min TCP default (same options as internal/postapply/ssh.go).
 resource "null_resource" "authorize_key" {
   triggers = {
     always = timestamp()
@@ -19,7 +21,7 @@ resource "null_resource" "authorize_key" {
     interpreter = ["bash", "-c"]
     command     = <<-EOT
       echo "STAGE: Authorizing this run's SSH key on ${var.existing_vm_ip}"
-      ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new ${var.admin_username}@${var.existing_vm_ip} 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys' < "${pathexpand(var.ssh_public_key_path)}"
+      ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o StrictHostKeyChecking=accept-new ${var.admin_username}@${var.existing_vm_ip} 'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys' < "${pathexpand(var.ssh_public_key_path)}"
     EOT
   }
 }
@@ -63,6 +65,7 @@ resource "null_resource" "wait_for_combine_fl" {
       client_advertise_host   = var.existing_vm_ip
       self_ip                 = var.existing_vm_ip
       gateway_image           = var.gateway_image != "" ? var.gateway_image : "ghcr.io/${var.ghcr_namespace}/flotilla-gateway:${var.image_tag}"
+      gateway_client_roles    = var.gateway_client_roles
       gateway_dir             = var.gateway_dir
       sidecar_dir             = var.sidecar_dir
       flotilla_dir            = var.flotilla_dir
@@ -94,9 +97,11 @@ resource "null_resource" "configure_broker" {
   provisioner "local-exec" {
     interpreter = ["bash", "-c"]
     command = templatefile("${path.module}/templates/configure-broker.sh.tftpl", {
-      self_ip          = var.existing_vm_ip
-      role             = var.role
-      participant_name = var.participant_name
+      self_ip = var.existing_vm_ip
+      role    = var.role
+      # Providers of one submission share participant_name; instance_key
+      # keeps their vm_registry entries apart (as in ../main.tf).
+      participant_name = var.instance_key == "" ? var.participant_name : "${var.participant_name}-${var.instance_key}"
       gov_layer_url    = var.gov_layer_url
       gov_layer_token  = var.gov_layer_token
     })

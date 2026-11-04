@@ -14,7 +14,11 @@ func TestParseDryRunVMs(t *testing.T) {
 	if err != nil || len(got) != 3 || got["vm:Client One"] != "198.51.100.20" || got["vm:client-2"] != "198.51.100.30" {
 		t.Fatalf("vm entries: got %v, %v", got, err)
 	}
-	for _, bad := range []string{"user", "user=", "=192.0.2.10", "admin=192.0.2.10", "user=192.0.2.10,", "user=a,,data-provider=b", "vm:=192.0.2.10", "vm: =192.0.2.10"} {
+	got, err = ParseDryRunVMs("data-provider=192.0.2.10,user:alice=198.51.100.20")
+	if err != nil || len(got) != 2 || got["user:alice"] != "198.51.100.20" {
+		t.Fatalf("user entries: got %v, %v", got, err)
+	}
+	for _, bad := range []string{"user:=192.0.2.10", "user: =192.0.2.10", "user", "user=", "=192.0.2.10", "admin=192.0.2.10", "user=192.0.2.10,", "user=a,,data-provider=b", "vm:=192.0.2.10", "vm: =192.0.2.10"} {
 		if _, err := ParseDryRunVMs(bad); err == nil {
 			t.Errorf("%q: expected error", bad)
 		}

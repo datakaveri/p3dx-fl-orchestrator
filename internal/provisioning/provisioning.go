@@ -93,11 +93,17 @@ func (p *Provisioner) IsProvisioning(runKey string) bool {
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
 var trimDashRe = regexp.MustCompile(`^-+|-+$`)
 
-// dryRunHostFor picks this run's existing VM from DRY_RUN_VMS: a
-// "vm:<VM Name>" entry whose name slugifies to participantName wins, so two
-// providers (same role) can each be pinned to their own VM; otherwise the
-// role's entry. "" = no VM configured for this run.
-func dryRunHostFor(vms map[string]string, role, participantName string) string {
+// dryRunHostFor picks this run's existing VM from DRY_RUN_VMS. Every VM of
+// one submission shares its name now, so a "user:<username>" entry for the
+// caller wins (two providers each pinned to their own VM); then a legacy
+// "vm:<VM Name>" entry whose name slugifies to participantName; otherwise
+// the role's entry. "" = no VM configured for this run.
+func dryRunHostFor(vms map[string]string, role, username, participantName string) string {
+	for key, host := range vms {
+		if name, ok := strings.CutPrefix(key, "user:"); ok && strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(username)) {
+			return host
+		}
+	}
 	for key, host := range vms {
 		if name, ok := strings.CutPrefix(key, "vm:"); ok && slugify(name) == participantName {
 			return host
@@ -106,12 +112,50 @@ func dryRunHostFor(vms map[string]string, role, participantName string) string {
 	return vms[role]
 }
 
+// VMName is the name a run's VM gets. A submission's VMs are all named
+// p3dx-fl-<first 10 chars of the submission id, minus "gov-" and dashes> so
+// a VM in anyone's Azure portal is traceable to its FL session; the
+// client-chosen vmName is ignored then. Without a submission it falls back
+// to slugify(vmName), else the username.
+func VMName(submissionID, vmName, username string) string {
+	if submissionID != "" {
+		id := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(submissionID), "gov-"))
+		id = slugRe.ReplaceAllString(id, "") // drops the dashes (and anything else non-alphanumeric)
+		if len(id) > 10 {
+			id = id[:10]
+		}
+		if id != "" {
+			return "p3dx-fl-" + id
+		}
+	}
+	if strings.TrimSpace(vmName) != "" {
+		return slugify(vmName)
+	}
+	return slugify(username)
+}
+
+// instanceKey tells apart the non-VM resources (RG, vnet, NSG, ...) and the
+// terraform state of runs that share a VM name: each provider of one
+// submission gets their own, the server VM ("user" role) none. At most 16
+// chars, matching terraform's instance_key validation.
+func instanceKey(role, username string) string {
+	if role != "data-provider" {
+		return ""
+	}
+	key := slugify(username)
+	if len(key) > 16 {
+		key = trimDashRe.ReplaceAllString(key[:16], "")
+	}
+	return key
+}
+
 func slugify(name string) string {
 	slug := strings.ToLower(strings.TrimSpace(name))
 	slug = slugRe.ReplaceAllString(slug, "-")
 	slug = trimDashRe.ReplaceAllString(slug, "")
 	if len(slug) > 22 {
-		slug = slug[:22]
+		// re-trim: a cut can end on a dash, which participant_name rejects
+		slug = trimDashRe.ReplaceAllString(slug[:22], "")
 	}
 	if slug == "" {
 		return "participant"
@@ -249,9 +293,16 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	}
 
 	ev := &eventLogger{p: p, token: in.Token, username: in.Username}
-	// The VM (and its RG/vnet/NSG/disk/workspace) is named after the
-	// participant-chosen vmName, not their username/id.
-	participantName := slugify(in.VMName)
+	// The VM is named after the submission (see VMName); its RG/vnet/NSG/
+	// disk and terraform state also carry the role and instance key so a
+	// submission's VMs never collide in one subscription or state dir.
+	participantName := VMName(in.SubmissionID, in.VMName, in.Username)
+	instKey := instanceKey(in.Role, in.Username)
+	stateKey := in.Role
+	if instKey != "" {
+		stateKey += "-" + instKey
+	}
+	logName := participantName + "-" + stateKey
 
 	var workDir string
 	var applyOutputLines []string
@@ -282,18 +333,18 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	defer cleanup()
 
 	dryRun := len(p.cfg.DryRunVMs) > 0
-	dryRunHost := dryRunHostFor(p.cfg.DryRunVMs, in.Role, participantName)
+	dryRunHost := dryRunHostFor(p.cfg.DryRunVMs, in.Role, in.Username, participantName)
 	if dryRun && dryRunHost == "" {
-		p.fail(ev, participantName, nil, fmt.Errorf("dry run is on (DRY_RUN_VMS) but has no VM for VM Name %q or role %q", in.VMName, in.Role))
+		p.fail(ev, logName, nil, fmt.Errorf("dry run is on (DRY_RUN_VMS) but has no VM for user %q, VM Name %q or role %q", in.Username, in.VMName, in.Role))
 		return
 	}
 
 	if dryRun {
 		ev.emit("Starting", "", "running",
-			fmt.Sprintf(`Provisioning VM "%s" for %s (%s) in dry-run mode.`, in.VMName, in.Username, in.Role))
+			fmt.Sprintf(`Provisioning VM "%s" for %s (%s) in dry-run mode.`, participantName, in.Username, in.Role))
 	} else {
 		ev.emit("Starting", "", "running",
-			fmt.Sprintf(`Provisioning VM "%s" for %s (%s) — this needs one more Azure sign-in for Terraform itself.`, in.VMName, in.Username, in.Role))
+			fmt.Sprintf(`Provisioning VM "%s" for %s (%s) — this needs one more Azure sign-in for Terraform itself.`, participantName, in.Username, in.Role))
 	}
 
 	var err error
@@ -316,14 +367,14 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	} else {
 		ev.emit("Azure device login", "az login --use-device-code", "running", "Waiting for you to sign in via the code above...")
 		if err := p.deviceCodeLogin(env, ev); err != nil {
-			p.fail(ev, participantName, applyOutputLines, err)
+			p.fail(ev, logName, applyOutputLines, err)
 			return
 		}
 		ev.emit("Azure device login", "", "ok", "Signed in")
 
 		accountJSON, _, err := runCommand("az", []string{"account", "show", "-o", "json"}, "", env, nil)
 		if err != nil {
-			p.fail(ev, participantName, applyOutputLines, err)
+			p.fail(ev, logName, applyOutputLines, err)
 			return
 		}
 		var account struct {
@@ -334,7 +385,7 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 			} `json:"user"`
 		}
 		if err := json.Unmarshal([]byte(accountJSON), &account); err != nil {
-			p.fail(ev, participantName, applyOutputLines, err)
+			p.fail(ev, logName, applyOutputLines, err)
 			return
 		}
 		ev.emit("Azure account", "", "ok", fmt.Sprintf(`Using subscription "%s" (%s)`, account.Name, account.ID))
@@ -344,7 +395,7 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	keyPath = filepath.Join(workDir, "id_ed25519")
 	ev.emit("SSH key", "", "running", "Generating a fresh SSH keypair for this VM")
 	if _, _, err := runCommand("ssh-keygen", []string{"-t", "ed25519", "-N", "", "-f", keyPath, "-C", "p3dx-flo-" + participantName}, "", env, nil); err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
+		p.fail(ev, logName, applyOutputLines, err)
 		return
 	}
 	ev.emit("SSH key", "", "ok", "")
@@ -352,6 +403,7 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	tfOverrides := map[string]string{
 		"TF_VAR_role":                 in.Role,
 		"TF_VAR_participant_name":     participantName,
+		"TF_VAR_instance_key":         instKey,
 		"TF_VAR_created_by":           createdBy,
 		"TF_VAR_ssh_public_key_path":  keyPath + ".pub",
 		"TF_VAR_ssh_private_key_path": keyPath,
@@ -382,22 +434,23 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 
 	// Runs in a private copy of the terraform config so this run's
 	// `.terraform/` never collides with another concurrent run's.
-	// `-backend-config` points this private copy at the SAME persistent
-	// state file this participant's workspace has always used
-	// (terraform.tfstate.d/<name>/terraform.tfstate under tfDir), so nothing
-	// about where state lives actually changes.
-	statePath := filepath.Join(p.tfDir, "terraform.tfstate.d", participantName, "terraform.tfstate")
+	// `-backend-config` points this private copy at a persistent state file
+	// per VM name AND role/instance key
+	// (terraform.tfstate.d/<name>/<role>[-<instance_key>]/terraform.tfstate
+	// under tfDir): a submission's server and provider VMs share one name,
+	// so the name alone would make them overwrite each other's state.
+	statePath := filepath.Join(p.tfDir, "terraform.tfstate.d", participantName, stateKey, "terraform.tfstate")
 	if dryRun {
 		// Kept apart from real runs' state: a dry run has no azurerm
 		// resources, so sharing a participant's real state would break both.
-		statePath = filepath.Join(p.tfDir, "terraform.tfstate.d", "dry-run", participantName, "terraform.tfstate")
+		statePath = filepath.Join(p.tfDir, "terraform.tfstate.d", "dry-run", participantName, stateKey, "terraform.tfstate")
 	}
 	if err := os.MkdirAll(p.pluginCacheDir, 0o755); err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
+		p.fail(ev, logName, applyOutputLines, err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
+		p.fail(ev, logName, applyOutputLines, err)
 		return
 	}
 	tfOverrides["TF_PLUGIN_CACHE_DIR"] = p.pluginCacheDir
@@ -409,7 +462,7 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	ev.emit("Preparing Terraform config", "", "running", "Setting up an isolated working directory for this run")
 	runTfDir, err := p.copyTerraformSource(workDir, dryRun)
 	if err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
+		p.fail(ev, logName, applyOutputLines, err)
 		return
 	}
 	ev.emit("Preparing Terraform config", "", "ok", "")
@@ -419,7 +472,7 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 	_, _, err = runCommand("terraform", []string{"init", "-input=false", "-no-color", "-backend-config=path=" + statePath}, runTfDir, tfEnv, nil)
 	p.initMu.Unlock()
 	if err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
+		p.fail(ev, logName, applyOutputLines, err)
 		return
 	}
 	ev.emit("Terraform init", "", "ok", "")
@@ -440,17 +493,23 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 			return
 		}
 		if m := localStageLineRe.FindStringSubmatch(line); m != nil {
-			ev.emit("Broker config", "", "running", strings.TrimSpace(m[1]))
+			// The dry run's authorize_key is a local-exec too, but it is
+			// part of setting up the VM, not of the broker registration.
+			step := "Broker config"
+			if strings.Contains(line, "null_resource.authorize_key") {
+				step = "VM setup"
+			}
+			ev.emit(step, "", "running", strings.TrimSpace(m[1]))
 		}
 	})
 	if err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
+		p.fail(ev, logName, applyOutputLines, err)
 		return
 	}
 
 	outputsJSON, _, err := runCommand("terraform", []string{"output", "-json"}, runTfDir, tfEnv, nil)
 	if err != nil {
-		p.fail(ev, participantName, applyOutputLines, err)
+		p.fail(ev, logName, applyOutputLines, err)
 		return
 	}
 	var outputs struct {
@@ -467,7 +526,7 @@ func (p *Provisioner) RunAutoProvision(in RunAutoProvisionInput) {
 		target := postapply.SSHTarget{Host: outputs.PublicIP.Value, User: p.cfg.SSHUser, Port: p.cfg.SSHPort,
 			KeyPath: keyPath, KnownHosts: filepath.Join(workDir, "known_hosts")}
 		if err := p.runPostApply(in, target, outputs.PublicIP.Value, ev); err != nil {
-			p.fail(ev, participantName, nil, err)
+			p.fail(ev, logName, nil, err)
 			return
 		}
 	}
@@ -532,11 +591,13 @@ func (p *Provisioner) runPostApply(in RunAutoProvisionInput, target postapply.SS
 	return nil
 }
 
-func (p *Provisioner) fail(ev *eventLogger, participantName string, applyOutputLines []string, cause error) {
+// fail reports a failed run; logName (<vm name>-<role>[-<instance key>])
+// names the saved apply log, unique per VM of a submission.
+func (p *Provisioner) fail(ev *eventLogger, logName string, applyOutputLines []string, cause error) {
 	message := cause.Error()
 	if len(applyOutputLines) > 0 {
 		if err := os.MkdirAll(p.provisioningLogDir, 0o755); err == nil {
-			logPath := filepath.Join(p.provisioningLogDir, fmt.Sprintf("%s-%d.log", participantName, time.Now().UnixMilli()))
+			logPath := filepath.Join(p.provisioningLogDir, fmt.Sprintf("%s-%d.log", logName, time.Now().UnixMilli()))
 			if err := os.WriteFile(logPath, []byte(strings.Join(applyOutputLines, "\n")), 0o644); err == nil {
 				// (remote-exec)/(local-exec) lines are the provisioner
 				// scripts' own output; "Error:" lines are terraform's own

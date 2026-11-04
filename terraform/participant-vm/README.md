@@ -93,11 +93,24 @@ down the same way. (Plain `terraform init && terraform apply` still works if
 you'd rather drive it yourself — but then you must set `participant_name`
 yourself in `terraform.tfvars`.)
 
-**VM naming:** if you leave `participant_name` unset in `terraform.tfvars`,
-`deploy.sh` derives it from your signed-in Azure identity (`az account show`)
-— e.g. `jdoe@company.com` → VM `flo-data-provider-jdoe`. The full identity is
-also stored on the VM as the `created_by` tag. Set `participant_name`
-explicitly if you'd rather choose the name yourself.
+**VM naming:** the VM itself (Azure name and hostname) is exactly
+`participant_name`; every other resource is named
+`flo-<role>-<participant_name>[-<instance_key>]` (resource group `rg-...`,
+`-vnet`, `-nsg`, `-nic`, `-pip`, `-osdisk`). If you leave `participant_name`
+unset in `terraform.tfvars`, `deploy.sh` derives it from your signed-in Azure
+identity (`az account show`) — e.g. `jdoe@company.com` → VM `jdoe` in
+`rg-flo-data-provider-jdoe`. The full identity is also stored on the VM as the
+`created_by` tag. Set `participant_name` explicitly if you'd rather choose the
+name yourself.
+
+When the orchestrator provisions a VM for an FL submission, `participant_name`
+is `p3dx-fl-<first 10 chars of the submission id without "gov-" and dashes>`
+(e.g. `gov-1a2b3c4d-5e6f-...` → `p3dx-fl-1a2b3c4d5e`) for the server VM and
+every provider VM alike. On a provider VM it sets `instance_key` to the
+provider's username slug (≤ 16 chars), so two providers deploying into one
+subscription get separate resource groups; its state lives at
+`terraform.tfstate.d/<participant_name>/<role>[-<instance_key>]/terraform.tfstate`
+(dry runs under `terraform.tfstate.d/dry-run/...`).
 
 It prints `ssh_command` in its output when it's done — use that to connect.
 

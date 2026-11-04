@@ -1,5 +1,10 @@
 locals {
-  name_prefix = "flo-${var.role}-${var.participant_name}"
+  # The VM itself is named exactly participant_name (p3dx-fl-<submission>),
+  # so it reads the same in every participant's portal. Everything else
+  # keeps a role-distinguished prefix, plus instance_key: a submission's
+  # providers share participant_name, and two of them deploying into one
+  # subscription must not collide on the resource group name.
+  name_prefix = var.instance_key == "" ? "flo-${var.role}-${var.participant_name}" : "flo-${var.role}-${var.participant_name}-${var.instance_key}"
 
   fl_inbound_rules = {
     "user" = [
@@ -113,8 +118,8 @@ resource "azurerm_network_interface" "this" {
 }
 
 resource "azurerm_linux_virtual_machine" "this" {
-  name                            = local.name_prefix
-  computer_name                   = substr(local.name_prefix, 0, 63)
+  name                            = var.participant_name
+  computer_name                   = var.participant_name
   resource_group_name             = azurerm_resource_group.this.name
   location                        = azurerm_resource_group.this.location
   size                            = var.vm_size
@@ -199,6 +204,7 @@ resource "null_resource" "wait_for_combine_fl" {
       self_ip                 = azurerm_public_ip.this[0].ip_address
       gateway_image           = var.gateway_image != "" ? var.gateway_image : "ghcr.io/${var.ghcr_namespace}/flotilla-gateway:${var.image_tag}"
       gateway_dir             = var.gateway_dir
+      gateway_client_roles    = var.gateway_client_roles
       sidecar_dir             = var.sidecar_dir
       flotilla_dir            = var.flotilla_dir
       val_data_dir            = var.val_data_dir
@@ -238,9 +244,12 @@ resource "null_resource" "configure_broker" {
   provisioner "local-exec" {
     interpreter = ["bash", "-c"]
     command = templatefile("${path.module}/templates/configure-broker.sh.tftpl", {
-      self_ip          = azurerm_public_ip.this[0].ip_address
-      role             = var.role
-      participant_name = var.participant_name
+      self_ip = azurerm_public_ip.this[0].ip_address
+      role    = var.role
+      # gov_layer keys vm_registry on (role, participant_name), and every
+      # provider VM of a submission shares participant_name — add
+      # instance_key so providers don't overwrite each other's entry.
+      participant_name = var.instance_key == "" ? var.participant_name : "${var.participant_name}-${var.instance_key}"
       gov_layer_url    = var.gov_layer_url
       gov_layer_token  = var.gov_layer_token
     })

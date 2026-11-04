@@ -15,12 +15,23 @@ variable "role" {
 }
 
 variable "participant_name" {
-  description = "Short, unique, lowercase-with-dashes identifier for this participant, used in the VM name/tags. When run via deploy.sh this is auto-derived from the signed-in Azure identity (az account show); set it explicitly here to override, or if you're calling terraform directly."
+  description = "Lowercase-with-dashes name of the VM itself (and, prefixed by role, of its other resources). The orchestrator sets p3dx-fl-<first 10 chars of the submission id>, shared by every VM of that FL submission; otherwise a short unique identifier for this participant. When run via deploy.sh this is auto-derived from the signed-in Azure identity (az account show); set it explicitly here to override, or if you're calling terraform directly."
   type        = string
 
   validation {
     condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,20}[a-z0-9])?$", var.participant_name))
     error_message = "participant_name must be 1-22 lowercase alphanumeric characters/dashes, and not start or end with a dash."
+  }
+}
+
+variable "instance_key" {
+  description = "Optional suffix for every non-VM resource name (resource group, vnet, NSG, NIC, IP, disk): flo-<role>-<participant_name>[-<instance_key>]. The orchestrator sets it to the provider's username slug on a data-provider VM, since all VMs of one FL submission share participant_name and two providers may deploy into the same subscription. Empty for the server (\"user\") VM."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[a-z0-9-]{0,16}$", var.instance_key))
+    error_message = "instance_key must be at most 16 lowercase alphanumeric characters/dashes."
   }
 }
 
@@ -194,4 +205,10 @@ variable "gateway_internal_subnet" {
   description = "Subnet of the server VM's internal-only Docker network (flotilla-server, redis, gateway). The gateway takes host .10."
   type        = string
   default     = "172.29.0.0/24"
+}
+
+variable "gateway_client_roles" {
+  description = "Comma-separated Keycloak realm roles (any-of) a VM token must hold to pass the server gateway (its CLIENT_ROLES). FL providers hold \"provider\"."
+  type        = string
+  default     = "provider"
 }

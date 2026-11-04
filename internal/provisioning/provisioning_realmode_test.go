@@ -3,6 +3,7 @@ package provisioning
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -47,6 +48,8 @@ LOG='` + logf + `'
   echo "ENV TF_VAR_created_by=${TF_VAR_created_by-<unset>}"
   echo "ENV TF_VAR_existing_vm_ip=${TF_VAR_existing_vm_ip-<unset>}"
   echo "ENV TF_VAR_admin_username=${TF_VAR_admin_username-<unset>}"
+  echo "ENV TF_VAR_participant_name=${TF_VAR_participant_name-<unset>}"
+  echo "ENV TF_VAR_instance_key=${TF_VAR_instance_key-<unset>}"
 } >> "$LOG"
 `
 	script := func(name, body string) {
@@ -103,8 +106,13 @@ exit 0
 
 func (f *rmFixture) run(t *testing.T, role string) (string, []vmsession.Event) {
 	t.Helper()
-	tok := f.store.CreateToken("alice", role)
-	f.p.RunAutoProvision(RunAutoProvisionInput{Token: tok, Username: "alice", Role: role, VMName: "My VM", RunKey: "rk"})
+	return f.runAs(t, "alice", role)
+}
+
+func (f *rmFixture) runAs(t *testing.T, username, role string) (string, []vmsession.Event) {
+	t.Helper()
+	tok := f.store.CreateToken(username, role)
+	f.p.RunAutoProvision(RunAutoProvisionInput{Token: tok, Username: username, Role: role, VMName: "My VM", RunKey: "rk"})
 	snap, ok := f.store.Get(tok)
 	if !ok {
 		t.Fatal("no session")
@@ -130,12 +138,14 @@ func TestRunAutoProvisionRealModeUnchanged(t *testing.T) {
 		"CMD az login --use-device-code\n", // no --tenant when AZURE_TENANT_ID is unset
 		"CMD az account show -o json",
 		"CMD ssh-keygen -t ed25519",
-		"CMD terraform init -input=false -no-color -backend-config=path=" + filepath.Join(f.tfDir, "terraform.tfstate.d", "my-vm", "terraform.tfstate") + "\n",
+		"CMD terraform init -input=false -no-color -backend-config=path=" + filepath.Join(f.tfDir, "terraform.tfstate.d", "my-vm", "user", "terraform.tfstate") + "\n",
 		"CMD terraform apply -auto-approve -input=false -no-color",
 		"CMD terraform output -json",
 		"ENV TF_VAR_created_by=tester@example.com",
 		"ENV TF_VAR_existing_vm_ip=<unset>",
 		"ENV TF_VAR_admin_username=<unset>",
+		"ENV TF_VAR_participant_name=my-vm",
+		"ENV TF_VAR_instance_key=\n",
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("log missing %q\n%s", want, log)
@@ -190,7 +200,7 @@ func TestRunAutoProvisionDryRunMode(t *testing.T) {
 		"ENV TF_VAR_existing_vm_ip=192.0.2.10",
 		"ENV TF_VAR_admin_username=azureuser",
 		"ENV TF_VAR_created_by=dry-run",
-		"-backend-config=path=" + filepath.Join(f.tfDir, "terraform.tfstate.d", "dry-run", "my-vm", "terraform.tfstate"),
+		"-backend-config=path=" + filepath.Join(f.tfDir, "terraform.tfstate.d", "dry-run", "my-vm", "user", "terraform.tfstate"),
 	} {
 		if !strings.Contains(log, want) {
 			t.Errorf("log missing %q\n%s", want, log)
@@ -215,15 +225,73 @@ func TestRunAutoProvisionDryRunVMNameWins(t *testing.T) {
 	}
 }
 
-func TestDryRunHostFor(t *testing.T) {
-	vms := map[string]string{"data-provider": "192.0.2.20", "vm:Client 2": "192.0.2.30"}
-	for _, tc := range []struct{ role, name, want string }{
-		{"data-provider", "client-2", "192.0.2.30"},
-		{"data-provider", "client-1", "192.0.2.20"},
-		{"user", "client-1", ""},
+func TestRunAutoProvisionDryRunUserWins(t *testing.T) {
+	// Every VM of a submission shares one name, so the caller picks the VM.
+	f := newRMFixture(t, map[string]string{"data-provider": "192.0.2.10", "vm:My VM": "192.0.2.30", "user:bob": "192.0.2.50"})
+	log, _ := f.runAs(t, "bob", "data-provider")
+
+	for _, want := range []string{
+		"ENV TF_VAR_existing_vm_ip=192.0.2.50",
+		"ENV TF_VAR_instance_key=bob\n",
+		"-backend-config=path=" + filepath.Join(f.tfDir, "terraform.tfstate.d", "dry-run", "my-vm", "data-provider-bob", "terraform.tfstate"),
 	} {
-		if got := dryRunHostFor(vms, tc.role, tc.name); got != tc.want {
-			t.Errorf("dryRunHostFor(%q, %q) = %q, want %q", tc.role, tc.name, got, tc.want)
+		if !strings.Contains(log, want) {
+			t.Errorf("log missing %q\n%s", want, log)
+		}
+	}
+}
+
+func TestDryRunHostFor(t *testing.T) {
+	vms := map[string]string{"data-provider": "192.0.2.20", "vm:Client 2": "192.0.2.30", "user:Alice": "192.0.2.40"}
+	for _, tc := range []struct{ role, username, name, want string }{
+		{"data-provider", "bob", "client-2", "192.0.2.30"},
+		{"data-provider", "bob", "client-1", "192.0.2.20"},
+		{"data-provider", "alice", "client-2", "192.0.2.40"}, // user: beats vm:
+		{"user", "alice", "p3dx-fl-1a2b3c4d5e", "192.0.2.40"},
+		{"user", "bob", "client-1", ""},
+	} {
+		if got := dryRunHostFor(vms, tc.role, tc.username, tc.name); got != tc.want {
+			t.Errorf("dryRunHostFor(%q, %q, %q) = %q, want %q", tc.role, tc.username, tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestVMName(t *testing.T) {
+	for _, tc := range []struct{ sub, vmName, user, want string }{
+		{"gov-1a2b3c4d-5e6f-7a8b-9c0d-112233445566", "ignored", "alice", "p3dx-fl-1a2b3c4d5e"},
+		{"GOV-1A2B3C4D-5E6F", "", "alice", "p3dx-fl-gov1a2b3c4"}, // only a lowercase gov- prefix is the gov_layer one
+		{"abc-de", "", "alice", "p3dx-fl-abcde"},
+		{"", "My VM", "alice", "my-vm"},
+		{"", "  ", "Alice.Smith", "alice-smith"},
+		{"", "", "", "participant"},
+		{"---", "My VM", "alice", "my-vm"}, // nothing usable in the submission id
+	} {
+		got := VMName(tc.sub, tc.vmName, tc.user)
+		if got != tc.want {
+			t.Errorf("VMName(%q, %q, %q) = %q, want %q", tc.sub, tc.vmName, tc.user, got, tc.want)
+		}
+		if !participantNameRe.MatchString(got) {
+			t.Errorf("VMName(%q, ...) = %q fails terraform's participant_name validation", tc.sub, got)
+		}
+	}
+}
+
+// participantNameRe is variables.tf's participant_name validation.
+var participantNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,20}[a-z0-9])?$`)
+
+func TestInstanceKey(t *testing.T) {
+	for _, tc := range []struct{ role, user, want string }{
+		{"user", "operator", ""},
+		{"data-provider", "Bob", "bob"},
+		{"data-provider", "provider.with.a-long-name", "provider-with-a"}, // cut at 16, trailing dash trimmed
+		{"data-provider", "", "participant"},
+	} {
+		got := instanceKey(tc.role, tc.user)
+		if got != tc.want {
+			t.Errorf("instanceKey(%q, %q) = %q, want %q", tc.role, tc.user, got, tc.want)
+		}
+		if !regexp.MustCompile(`^[a-z0-9-]{0,16}$`).MatchString(got) {
+			t.Errorf("instanceKey %q fails terraform's instance_key validation", got)
 		}
 	}
 }
