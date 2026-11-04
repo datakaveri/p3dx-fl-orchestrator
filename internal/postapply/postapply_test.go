@@ -393,7 +393,7 @@ func TestRunErrorOmitsStdin(t *testing.T) {
 
 func TestSSHArgs(t *testing.T) {
 	got := strings.Join(target.args("echo hi"), " ")
-	for _, want := range []string{"BatchMode=yes", "UserKnownHostsFile=/k/kh", "-i /k/id", "IdentitiesOnly=yes", "-p 22", "azureuser@10.0.0.5 echo hi"} {
+	for _, want := range []string{"BatchMode=yes", "ConnectTimeout=15", "ServerAliveInterval=15", "ServerAliveCountMax=4", "UserKnownHostsFile=/k/kh", "-i /k/id", "IdentitiesOnly=yes", "-p 22", "azureuser@10.0.0.5 echo hi"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("args %q missing %q", got, want)
 		}

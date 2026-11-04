@@ -150,7 +150,7 @@ type ClientInput struct {
 }
 
 // DeliverClient configures the sidecar on a new client VM, writes the VM
-// credential, starts client + sidecar, and tells p3dx-aaa it was delivered.
+// credential, starts client + sidecar, and tells the controlplane it was delivered.
 func (r *Runner) DeliverClient(t SSHTarget, in ClientInput, emit Emit) error {
 	defer wipe(in.Token)
 	emit("Connecting to the session", "running", "Configuring the client's gateway sidecar")
@@ -182,7 +182,7 @@ func (r *Runner) DeliverClient(t SSHTarget, in ClientInput, emit Emit) error {
 	if err := r.serviceCall(r.cfg.AAAURL+"/p3dx/internal/fl/vm-credentials/"+in.CredentialID+"/delivered",
 		map[string]string{}, nil); err != nil {
 		// Delivery itself succeeded; the bookkeeping call failing is not fatal.
-		emit("Connecting to the session", "running", "Note: could not record delivery with p3dx-aaa")
+		emit("Connecting to the session", "running", "Note: could not record delivery with the controlplane")
 	}
 	emit("Connecting to the session", "ok", "Client and sidecar started; joining through the session gateway")
 	return nil

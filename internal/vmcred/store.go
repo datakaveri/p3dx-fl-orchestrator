@@ -1,4 +1,4 @@
-// Package vmcred holds Flotilla VM credentials between the moment p3dx-aaa
+// Package vmcred holds Flotilla VM credentials between the moment the controlplane
 // hands one over (POST /p3dx/internal/vm-credentials) and the moment the
 // provisioning run writes it onto the provider's new client VM.
 //
@@ -10,7 +10,7 @@
 //     submission (anything else is refused);
 //   - Take hands the bytes out exactly once and wipes the stored copy;
 //   - a credential not taken within the TTL is wiped and dropped (its
-//     Keycloak session still ends at contract expiry; p3dx-aaa's sweeper
+//     Keycloak session still ends at contract expiry; the controlplane's sweeper
 //     removes it).
 package vmcred
 
@@ -35,7 +35,7 @@ type Credential struct {
 	ContractID   string
 	Username     string
 	UserID       string
-	ExpiresAt    string // contract valid_until, as p3dx-aaa reported it
+	ExpiresAt    string // contract valid_until, as the controlplane reported it
 	token        []byte
 	received     time.Time
 	claimed      bool
@@ -67,7 +67,7 @@ func wipe(b []byte) {
 	}
 }
 
-// Put stores a credential handed over by p3dx-aaa. The token slice is copied
+// Put stores a credential handed over by the controlplane. The token slice is copied
 // and the caller's copy wiped.
 func (s *Store) Put(c Credential, token []byte) error {
 	if c.ID == "" || c.Username == "" || c.SubmissionID == "" || len(token) == 0 {

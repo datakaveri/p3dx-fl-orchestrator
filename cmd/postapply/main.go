@@ -7,7 +7,7 @@
 //	client VM:  postapply -role data-provider -host 74.224.88.55 -submission <id> \
 //	                -user prov-a -gateway-host 20.235.21.40 -ca-file ca.pem
 //
-// For a client VM it listens on PORT (default 3002) for p3dx-aaa's credential
+// For a client VM it listens on PORT (default 3002) for the controlplane's credential
 // hand-over (exactly like the orchestrator), then claims, delivers and wipes
 // it. Reads the same .env / environment as the server.
 package main
@@ -22,6 +22,7 @@ import (
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmcred"
@@ -34,6 +35,7 @@ import (
 func followSession(cfg *config.Config, tokens *keycloak.TokenSource, submission, ip, caPEM string, expect int, wait time.Duration) {
 	store := vmsession.NewStore()
 	flow := flauto.NewManager(store, tokens.Token, cfg.GatewayRESTPort)
+	flow.SetFLConfigSource(govclient.New(cfg.GovLayerURL, tokens.Token))
 	runToken := store.CreateToken("postapply", "user")
 	if err := flow.SetGatewayCA(submission, caPEM); err != nil {
 		log.Fatal(err)
@@ -119,7 +121,7 @@ func main() {
 		mux.HandleFunc("/p3dx/internal/vm-credentials", handoff(cfg.InternalServiceKey, creds, got))
 		srv := &http.Server{Addr: ":" + cfg.Port, Handler: mux}
 		go func() { _ = srv.ListenAndServe() }()
-		log.Printf("waiting up to %s for p3dx-aaa to hand over %s's VM credential on :%s …", *wait, *user, cfg.Port)
+		log.Printf("waiting up to %s for the controlplane to hand over %s's VM credential on :%s …", *wait, *user, cfg.Port)
 		var id string
 		select {
 		case id = <-got:
