@@ -20,6 +20,7 @@ package flauto
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -30,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmsession"
 )
@@ -38,9 +40,16 @@ import (
 // session gateway's REST API accepts only that token, over TLS.
 type TokenFunc func() (string, error)
 
+// FLConfigSource supplies the training settings of a submission's signed
+// contract (govclient.Client; stubbed in tests).
+type FLConfigSource interface {
+	LatestFLConfig(ctx context.Context, submissionID string) (*govclient.FLRunConfig, error)
+}
+
 const (
-	pollInterval = 5 * time.Second
-	maxWait      = 2 * time.Hour // give up after 2h of not everyone connecting
+	pollInterval    = 5 * time.Second
+	maxWait         = 2 * time.Hour // give up after 2h of not everyone connecting
+	flConfigTimeout = 15 * time.Second
 )
 
 var nonAlnum = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
@@ -52,11 +61,15 @@ type submissionState struct {
 	tokens                map[string]struct{}
 	gatewayCA             *x509.CertPool // the session gateway's CA (gov_layer's governance CA)
 	gatewayCAPEM          string
-	ownerReady            chan struct{}  // closed once ownerIP is set
+	ownerReady            chan struct{} // closed once ownerIP is set
 	lastConnectedCount    int
 	started               bool
 	polling               bool
 	pollStartedAt         time.Time
+	// finished: this session is over (training ended or failed, or the wait
+	// for clients gave up). "Start Again" reuses the submission id, so the
+	// next run for it starts from a fresh state (see getOrCreate).
+	finished bool
 }
 
 // Manager tracks FL auto-start state per submission.
@@ -64,6 +77,7 @@ type Manager struct {
 	store    *vmsession.Store
 	token    TokenFunc
 	restPort int
+	flConfig FLConfigSource // required: startSession refuses to run without one
 
 	mu          sync.Mutex
 	submissions map[string]*submissionState
@@ -76,6 +90,8 @@ type Manager struct {
 	uploadClient      *http.Client                        // tests: nil = default client
 	queryPastAttempts int
 	queryPastWait     time.Duration
+
+	roundPollInterval time.Duration // tests: 0 = defaultRoundPollInterval
 }
 
 func NewManager(store *vmsession.Store, token TokenFunc, restPort int) *Manager {
@@ -86,6 +102,10 @@ func NewManager(store *vmsession.Store, token TokenFunc, restPort int) *Manager 
 		submissions: make(map[string]*submissionState),
 	}
 }
+
+// SetFLConfigSource sets where startSession reads each session's contract
+// fl_config from.
+func (m *Manager) SetFLConfigSource(src FLConfigSource) { m.flConfig = src }
 
 // client returns an HTTPS client that trusts only this session gateway's CA.
 // The gateway certificate names the server VM's IP, so the URL uses the IP.
@@ -149,19 +169,57 @@ func (m *Manager) WaitOwnerIP(submissionID string, timeout time.Duration) (strin
 	return s.ownerIP, s.gatewayCAPEM, nil
 }
 
+func newSubmissionState() *submissionState {
+	return &submissionState{
+		tokens:             make(map[string]struct{}),
+		ownerReady:         make(chan struct{}),
+		lastConnectedCount: -1,
+	}
+}
+
+// getOrCreate returns the submission's live state. A finished session's state
+// is replaced by a fresh one on the next run for that submission (a restart
+// reuses the submission id): otherwise its "training already started" flag
+// would stop the new session from auto-starting, client VMs would be pointed
+// at the old server VM's gateway, and the old, finished panels would get the
+// new run's events. Only the expected-provider count carries over (the
+// restart re-registers it anyway). Output collection reads the old state via
+// lookup, and falls back to the saved owner info once it is replaced.
 func (m *Manager) getOrCreate(submissionID string) *submissionState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s, ok := m.submissions[submissionID]
-	if !ok {
-		s = &submissionState{
-			tokens:             make(map[string]struct{}),
-			ownerReady:         make(chan struct{}),
-			lastConnectedCount: -1,
+	expected := 0
+	if ok {
+		s.mu.Lock()
+		var finished bool
+		finished, expected = s.finished, s.expectedProviderCount
+		s.mu.Unlock()
+		if !finished {
+			return s
 		}
-		m.submissions[submissionID] = s
+		log.Printf("[flauto] submission %s: previous session is over, starting fresh for the new run", submissionID)
 	}
+	s = newSubmissionState()
+	s.expectedProviderCount = expected
+	m.submissions[submissionID] = s
 	return s
+}
+
+// finish marks the session over; see submissionState.finished.
+func (m *Manager) finish(s *submissionState) {
+	s.mu.Lock()
+	s.finished = true
+	s.mu.Unlock()
+}
+
+// PrepareOwnerRun is called when a new server-VM run starts for a
+// submission, so a finished earlier session's state is dropped right away
+// (before this run's VM is up) rather than on its first registration.
+func (m *Manager) PrepareOwnerRun(submissionID string) {
+	if submissionID != "" {
+		m.getOrCreate(submissionID)
+	}
 }
 
 func (m *Manager) emit(s *submissionState, step, status, message string) {
@@ -262,6 +320,7 @@ func (m *Manager) pollOnce(submissionID string, s *submissionState) bool {
 		s.mu.Unlock()
 		m.emit(s, "Waiting for clients", "error",
 			fmt.Sprintf("Gave up after 2h — not all %d provider(s) connected. Start the session manually over SSH once they do.", expected))
+		m.finish(s)
 		return true
 	}
 	ownerIP := s.ownerIP
@@ -318,9 +377,19 @@ func (m *Manager) clientCount(s *submissionState, ownerIP string) (int, error) {
 func (m *Manager) startSession(submissionID string, s *submissionState) {
 	m.emit(s, "Starting FL session", "running", "All expected providers connected — starting training")
 
+	// A config flo_server cannot run would be retried forever, so a contract
+	// we cannot read or whose fl_config is out of range stops here.
+	fl, flCfg, err := m.sessionFLConfig(submissionID)
+	if err != nil {
+		m.emit(s, "FL session", "error", "Cannot start the FL session: "+err.Error())
+		m.finish(s)
+		log.Printf("[flauto] submission %s: FL session not started: %v", submissionID, err)
+		return
+	}
+
 	sessionID := nonAlnum.ReplaceAllString(submissionID, "_")
 	body := map[string]any{
-		"federated_learning_config": flotillaQuicksetupConfig,
+		"federated_learning_config": flCfg,
 		"session_id":                sessionID,
 		"file":                      false,
 		"restore":                   false,
@@ -332,19 +401,30 @@ func (m *Manager) startSession(submissionID string, s *submissionState) {
 	ownerIP := s.ownerIP
 	s.mu.Unlock()
 
+	maxRounds := fl.NumRounds
+	if maxRounds <= 0 {
+		maxRounds = quicksetupMaxRounds()
+	}
+
 	// POST /execute_command blocks server-side until the whole training run
 	// finishes (could be a long time) - fire it and move on instead of
 	// blocking this goroutine on it; its eventual resolution/rejection
 	// becomes one more event for whoever's still watching this submission's
 	// panels.
 	go func() {
+		// Whatever the outcome, this session is over once the request settles.
+		defer m.finish(s)
 		req, err := m.gatewayRequest(http.MethodPost, fmt.Sprintf("https://%s:%d/execute_command", ownerIP, m.restPort), payload)
 		if err != nil {
 			m.emit(s, "FL session", "error", err.Error())
 			return
 		}
+		// Round progress while execute_command blocks; stopped before the
+		// session's final event so no round event can follow it.
+		stopRounds := m.startRoundPoller(s, ownerIP, sessionID, maxRounds)
 		// no timeout — mirrors the Node version's timeout: 0
 		resp, err := m.client(s, 0).Do(req)
+		stopRounds()
 		if err != nil {
 			m.emit(s, "FL session", "error", err.Error())
 			return
@@ -376,6 +456,27 @@ func (m *Manager) startSession(submissionID string, s *submissionState) {
 		}()
 	}()
 
-	m.emit(s, "Starting FL session", "ok", fmt.Sprintf("Session %s started — training is now running on the server VM", sessionID))
+	m.emit(s, "Starting FL session", "ok", fmt.Sprintf(
+		"Session %s started — training is now running on the server VM — %d rounds, %d local epochs, lr %g, batch %d",
+		sessionID, fl.NumRounds, fl.LocalEpochs, fl.LearningRate, fl.BatchSize))
 	log.Printf("[flauto] submission %s: FL session %s started on %s", submissionID, sessionID, ownerIP)
+}
+
+// sessionFLConfig fetches the submission's contract fl_config and builds the
+// federated_learning_config from it.
+func (m *Manager) sessionFLConfig(submissionID string) (*govclient.FLRunConfig, map[string]any, error) {
+	if m.flConfig == nil {
+		return nil, nil, fmt.Errorf("no gov_layer configured to read the contract's FL settings from")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), flConfigTimeout)
+	defer cancel()
+	fl, err := m.flConfig.LatestFLConfig(ctx, submissionID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the contract's FL settings: %w", err)
+	}
+	cfg, err := sessionConfigFor(fl)
+	if err != nil {
+		return nil, nil, err
+	}
+	return fl, cfg, nil
 }

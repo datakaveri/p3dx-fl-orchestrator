@@ -1,5 +1,12 @@
 package flauto
 
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
+)
+
 // flotillaQuicksetupConfig is a Go transcription of
 // Flotilla_Deployment/config/flotilla_quicksetup_config.yaml (CIFAR10_IID +
 // FedAT_CNN demo, 100 rounds) — the dataset cloud-init.sh.tftpl already
@@ -59,4 +66,49 @@ var flotillaQuicksetupConfig = map[string]any{
 		"custom_validator_args":  "None",
 		"model_args":             map[string]any{"num_classes": 10},
 	},
+}
+
+// sessionConfigFor returns the federated_learning_config for a session from
+// its contract's fl_config, which is required. The values are range-checked —
+// flo_server retries a config it cannot run forever — and applied to a deep
+// copy of flotillaQuicksetupConfig (model, dataset, aggregator), never to the
+// package-level map itself.
+func sessionConfigFor(fl *govclient.FLRunConfig) (map[string]any, error) {
+	if fl == nil {
+		return nil, fmt.Errorf("the contract has no fl_config")
+	}
+	switch {
+	case fl.NumRounds < 1 || fl.NumRounds > 100:
+		return nil, fmt.Errorf("fl_config.num_rounds must be between 1 and 100 (got %d)", fl.NumRounds)
+	case fl.LocalEpochs < 1 || fl.LocalEpochs > 5:
+		return nil, fmt.Errorf("fl_config.local_epochs must be between 1 and 5 (got %d)", fl.LocalEpochs)
+	case !(fl.LearningRate > 0 && fl.LearningRate <= 1): // also rejects NaN
+		return nil, fmt.Errorf("fl_config.learning_rate must be > 0 and <= 1 (got %g)", fl.LearningRate)
+	case fl.BatchSize < 1 || fl.BatchSize > 1024:
+		return nil, fmt.Errorf("fl_config.batch_size must be between 1 and 1024 (got %d)", fl.BatchSize)
+	}
+
+	// JSON round-trip deep copy; numbers come back as float64, which marshal
+	// to the same JSON (1000, 0.0001, ...).
+	raw, err := json.Marshal(flotillaQuicksetupConfig)
+	if err != nil {
+		return nil, err
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, err
+	}
+	session := cfg["session_config"].(map[string]any)
+	bench := cfg["benchmark_config"].(map[string]any)
+	client := cfg["client_training_config"].(map[string]any)
+
+	session["termination_condition_args"].(map[string]any)["max_rounds"] = fl.NumRounds
+	client["epochs"] = fl.LocalEpochs
+	client["learning_rate"] = fl.LearningRate
+	bench["learning_rate"] = fl.LearningRate
+	client["batch_size"] = fl.BatchSize
+	bench["batch_size"] = fl.BatchSize
+	// 100s per local epoch, never below the quicksetup default of 300s.
+	client["train_timeout_duration_s"] = max(300, 100*fl.LocalEpochs)
+	return cfg, nil
 }
