@@ -24,6 +24,7 @@ import (
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/gatewayca"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
@@ -42,6 +43,7 @@ type Server struct {
 	prov  *provisioning.Provisioner
 	creds *vmcred.Store
 	gov   ContractSource
+	ca    *gatewayca.CA
 }
 
 // ContractSource reads a submission's contract parties from gov_layer
@@ -61,12 +63,18 @@ func New(cfg *config.Config) *Server {
 		}
 		keepOutOfGit(cfg.FLOutputStateDir)
 	}
+	// The orchestrator is the CA for session gateways.
+	ca, err := LoadGatewayCA(cfg)
+	if err != nil {
+		log.Fatalf("[fl-orchestrator] gateway CA: %v", err)
+	}
 	tokens := keycloak.NewTokenSource(cfg.KeycloakBaseURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret)
 	flow := flauto.NewManager(store, tokens.Token, cfg.GatewayRESTPort)
 	flow.ConfigureOutput(flauto.OutputConfig{
 		GovLayerURL: cfg.GovLayerURL, VMFlotillaDir: cfg.VMFlotillaDir,
 		SSHUser: cfg.SSHUser, SSHPort: cfg.SSHPort,
 		StateDir: cfg.FLOutputStateDir, VMRegistryToken: cfg.VMRegistryToken,
+		GatewayCAPEM: ca.CAPEM(),
 	})
 	// Sessions run with their contract's fl_config; an unreadable contract or
 	// a missing/out-of-range fl_config blocks the session.
@@ -78,8 +86,21 @@ func New(cfg *config.Config) *Server {
 		flow.RegisterProviderToken(submissionID, token)
 	}
 	creds := vmcred.NewStore(cfg.VMCredentialClaimTTL)
-	prov := provisioning.New(cfg, store, flow, creds, postapply.New(cfg, tokens))
-	return &Server{cfg: cfg, store: store, flow: flow, prov: prov, creds: creds, gov: gov}
+	prov := provisioning.New(cfg, store, flow, creds, postapply.New(cfg, tokens, ca, gov))
+	return &Server{cfg: cfg, store: store, flow: flow, prov: prov, creds: creds, gov: gov, ca: ca}
+}
+
+// LoadGatewayCA loads (or, on first start, creates) the orchestrator's
+// gateway CA from cfg, keeping its key and records out of git.
+func LoadGatewayCA(cfg *config.Config) (*gatewayca.CA, error) {
+	ca, err := gatewayca.LoadOrCreate(cfg.GatewayCAKeyPath, cfg.GatewayCACertPath, cfg.GatewayCertRecordsDir)
+	if err != nil {
+		return nil, err
+	}
+	keepOutOfGit(filepath.Dir(cfg.GatewayCAKeyPath))
+	log.Printf("[fl-orchestrator] gateway CA certificate: %s (expires %s)", cfg.GatewayCACertPath,
+		ca.Certificate().NotAfter.UTC().Format("2006-01-02"))
+	return ca, nil
 }
 
 // Handler returns the root http.Handler.
@@ -103,6 +124,9 @@ func (s *Server) registerRoutes(r chi.Router) {
 	// unauthenticated by nature (SSE — EventSource can't set headers).
 	r.Post("/vm-provisioning/events", s.postEvents)
 	r.Get("/vm-provisioning/stream", s.getStream)
+	// The gateway CA certificate, public: FL clients pin it to trust session
+	// gateways.
+	r.Get("/gateway-ca-cert", s.getGatewayCACert)
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireInternalKey)
@@ -220,6 +244,17 @@ func keepOutOfGit(dir string) {
 }
 
 type j = map[string]any
+
+// GET /gateway-ca-cert — the orchestrator's gateway CA certificate, PEM.
+func (s *Server) getGatewayCACert(w http.ResponseWriter, r *http.Request) {
+	if s.ca == nil {
+		writeJSON(w, http.StatusServiceUnavailable, j{"status": "FAILED", "error": "CA_NOT_LOADED"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(s.ca.CAPEM())
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

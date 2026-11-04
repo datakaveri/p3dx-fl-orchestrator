@@ -5,7 +5,7 @@ package flauto
 // off the server VM and push them to gov_layer, which stores and serves them.
 //
 //   - metrics: GET /query_past on the session gateway (service token, TLS
-//     pinned to the governance CA);
+//     pinned to the orchestrator's gateway CA);
 //   - model:   the highest-round model_<sid>_round_<N>.<ext> in the VM's
 //     deployment/checkpoints, read over SSH;
 //   - upload:  POST {GovLayerURL}/fl-output/{submissionID}, multipart
@@ -46,6 +46,10 @@ type OutputConfig struct {
 	SSHPort         string
 	StateDir        string // per-submission owner-VM access: <StateDir>/<sid>/{id_ed25519,known_hosts,owner.json}
 	VMRegistryToken string // X-VM-Registry-Token for gov_layer's /vm-registry (empty: not sent)
+	// GatewayCAPEM is the orchestrator's gateway CA certificate (gatewayca),
+	// which signs every session gateway's certificate: the fallback trust
+	// root when a session's CA is not in memory (e.g. after a restart).
+	GatewayCAPEM []byte
 }
 
 // sshRunner is the part of postapply.SSHTarget collection uses (stubbed in tests).
@@ -246,7 +250,7 @@ func (m *Manager) resolveOwner(submissionID string, s *submissionState) (string,
 	}
 	if pool == nil {
 		var err error
-		if pool, err = m.governanceCA(); err != nil {
+		if pool, err = m.gatewayCA(); err != nil {
 			return "", nil, fmt.Errorf("gateway CA unknown: %w", err)
 		}
 	}
@@ -311,16 +315,12 @@ func (m *Manager) registryOwnerIP() (string, error) {
 	return out.VM.IPAddress, nil
 }
 
-// governanceCA fetches the governance CA, which signs every session gateway's
-// certificate.
-func (m *Manager) governanceCA() (*x509.CertPool, error) {
-	body, err := m.govGet("/governance/ca-cert", nil)
-	if err != nil {
-		return nil, err
-	}
+// gatewayCA is the orchestrator's own gateway CA, which signs every session
+// gateway's certificate.
+func (m *Manager) gatewayCA() (*x509.CertPool, error) {
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(body) {
-		return nil, fmt.Errorf("gov_layer /governance/ca-cert returned no certificate")
+	if !pool.AppendCertsFromPEM(m.out.GatewayCAPEM) {
+		return nil, fmt.Errorf("no gateway CA certificate configured")
 	}
 	return pool, nil
 }

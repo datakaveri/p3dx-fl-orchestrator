@@ -115,11 +115,9 @@ type upload struct {
 
 type govFake struct {
 	srv      *httptest.Server
-	caPEM    string
 	ownerIP  string
 	mu       sync.Mutex
 	uploads  []upload
-	caCalls  int
 	regCalls int
 	regToken string
 }
@@ -127,12 +125,6 @@ type govFake struct {
 func newGovFake(t *testing.T) *govFake {
 	g := &govFake{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/governance/ca-cert", func(w http.ResponseWriter, r *http.Request) {
-		g.mu.Lock()
-		g.caCalls++
-		g.mu.Unlock()
-		_, _ = w.Write([]byte(g.caPEM))
-	})
 	mux.HandleFunc("/api/v1/vm-registry/output-owner", func(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		g.regCalls++
@@ -226,6 +218,7 @@ func setupOutputManager(t *testing.T, gw *gateway, gov *govFake, ssh *fakeSSH) (
 	m.ConfigureOutput(OutputConfig{
 		GovLayerURL: gov.srv.URL + "/api/v1/", VMFlotillaDir: "flotilla",
 		SSHUser: "azureuser", SSHPort: "22", StateDir: t.TempDir(), VMRegistryToken: "reg-secret",
+		GatewayCAPEM: []byte(gw.caPEM()),
 	})
 	m.queryPastAttempts, m.queryPastWait = 3, time.Millisecond
 	m.newSSH = func(tg postapply.SSHTarget) sshRunner {
@@ -298,9 +291,9 @@ func TestCollectOutputUploadsLatestModelAndMetrics(t *testing.T) {
 	if acc := md["global_validation_metrics"].(map[string]any)["accuracy"].([]any); len(acc) != 3 {
 		t.Fatalf("accuracy = %v", acc)
 	}
-	// In-memory state was enough: no gov_layer fallbacks.
-	if gov.caCalls != 0 || gov.regCalls != 0 {
-		t.Fatalf("unexpected fallbacks: ca=%d reg=%d", gov.caCalls, gov.regCalls)
+	// In-memory state was enough: no gov_layer fallback.
+	if gov.regCalls != 0 {
+		t.Fatalf("unexpected vm-registry fallbacks: %d", gov.regCalls)
 	}
 	for _, r := range ssh.remotes {
 		if !strings.Contains(r, "~/'flotilla/deployment/checkpoints'") {
@@ -320,20 +313,19 @@ func TestCollectOutputUploadsLatestModelAndMetrics(t *testing.T) {
 	}
 }
 
-func TestCollectOutputAfterRestartUsesSavedAccessAndGovCA(t *testing.T) {
+func TestCollectOutputAfterRestartUsesSavedAccessAndLocalCA(t *testing.T) {
 	gw, _ := queryPastGateway(t, 0)
 	gov := newGovFake(t)
-	gov.caPEM = gw.caPEM()
 	ssh := &fakeSSH{files: map[string][]byte{"model_sub_1_round_3.pt": []byte("weights")}}
 	m, _ := setupOutputManager(t, gw, gov, ssh)
 
 	// No submissionState at all (fresh process): IP from the saved owner
-	// info, CA from gov_layer.
+	// info, CA from the orchestrator's own gateway CA (OutputConfig).
 	if err := m.collectOutput("sub/1"); err != nil {
 		t.Fatalf("collectOutput: %v", err)
 	}
-	if gov.caCalls != 1 || gov.regCalls != 0 || ssh.host != "127.0.0.1" {
-		t.Fatalf("ca=%d reg=%d host=%q", gov.caCalls, gov.regCalls, ssh.host)
+	if gov.regCalls != 0 || ssh.host != "127.0.0.1" {
+		t.Fatalf("reg=%d host=%q", gov.regCalls, ssh.host)
 	}
 	if len(gov.uploads) != 1 || gov.uploads[0].round != "3" || string(gov.uploads[0].model) != "weights" {
 		t.Fatalf("uploads = %+v", gov.uploads)
@@ -390,7 +382,6 @@ func TestCollectOutputNoSavedKey(t *testing.T) {
 func TestCollectOutputShortStreamAbortsUpload(t *testing.T) {
 	gw, _ := queryPastGateway(t, 0)
 	gov := newGovFake(t)
-	gov.caPEM = gw.caPEM()
 	ssh := &fakeSSH{files: map[string][]byte{"model_sub_1_round_1.pt": modelBytes()}, short: true}
 	m, _ := setupOutputManager(t, gw, gov, ssh)
 	err := m.collectOutput("sub/1")

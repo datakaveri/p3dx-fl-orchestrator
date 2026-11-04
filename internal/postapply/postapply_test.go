@@ -2,7 +2,15 @@ package postapply
 
 import (
 	"bufio"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +23,7 @@ import (
 	"time"
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/gatewayca"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 )
 
@@ -39,7 +48,19 @@ type installRec struct {
 	Mode, Owner, Group, Dst, Content string
 }
 
-const fakeCSR = "-----BEGIN CERTIFICATE REQUEST-----\nMIIBfake\n-----END CERTIFICATE REQUEST-----\n"
+// fakeCSR is what the fake ssh prints for the gateway's tls.csr: a real P-256
+// CSR (each process makes its own), so the CA can sign it.
+var fakeCSR = func() string {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "gw"}}, key)
+	if err != nil {
+		panic(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))
+}()
 
 func fakeSSH(dir string, args []string) int {
 	stdin, _ := io.ReadAll(os.Stdin)
@@ -132,43 +153,45 @@ func installs(t *testing.T, dir string) map[string]installRec {
 	return m
 }
 
-// backend fakes Keycloak, gov_layer and p3dx-aaa on one server.
+// backend fakes Keycloak and the controlplane on one server, plus gov_layer's
+// contract check (gate) and a real gateway CA.
 type backend struct {
 	srv *httptest.Server
 
 	mu        sync.Mutex
-	govStatus int
-	govAuth   string
-	govBody   map[string]string
 	aaaStatus int
 	aaaAuth   string
 	aaaPath   string
 	aaaCalls  int
+
+	gate  *stubGate
+	ca    *gatewayca.CA
+	caDir string
 }
 
-const govResp = `{"serial":"ab","certificate_pem":"-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n","ca_certificate_pem":"CA","fingerprint_sha256":"ff","not_after":"2027-01-01T00:00:00Z","contract_id":"c1","project_id":"p1","job_id":"j1","submission_id":"s1","valid_until":"2027-01-01T00:00:00Z","parties":[{"id":"u1","name":"prov-a"}]}`
+// stubGate stands in for gov_layer's contract check.
+type stubGate struct {
+	err     error
+	gotSID  string
+	gotCall int
+}
+
+var testValidUntil = time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func (g *stubGate) GatewayAuthorization(_ context.Context, submissionID string, _ time.Time) (*gatewayca.Authorization, error) {
+	g.gotSID, g.gotCall = submissionID, g.gotCall+1
+	if g.err != nil {
+		return nil, g.err
+	}
+	return &gatewayca.Authorization{ContractID: "c1", ProjectID: "p1", JobID: "j1", SubmissionID: submissionID,
+		ValidUntil: testValidUntil, Parties: []gatewayca.Party{{ID: "u1", Name: "prov-a"}}}, nil
+}
 
 func newBackend(t *testing.T) *backend {
-	b := &backend{govStatus: 200, aaaStatus: 200}
+	b := &backend{aaaStatus: 200, gate: &stubGate{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/realms/master/protocol/openid-connect/token", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"access_token":"svc-token","expires_in":300}`))
-	})
-	mux.HandleFunc("/gov/gateway-certs", func(w http.ResponseWriter, r *http.Request) {
-		b.mu.Lock()
-		defer b.mu.Unlock()
-		b.govAuth = r.Header.Get("Authorization")
-		_ = json.NewDecoder(r.Body).Decode(&b.govBody)
-		if r.Method != http.MethodPost {
-			w.WriteHeader(405)
-			return
-		}
-		w.WriteHeader(b.govStatus)
-		if b.govStatus == 200 {
-			_, _ = w.Write([]byte(govResp))
-		} else {
-			_, _ = w.Write([]byte(`{"error":"CONFLICT","message":"already issued"}`))
-		}
 	})
 	mux.HandleFunc("/aaa/p3dx/internal/fl/vm-credentials/", func(w http.ResponseWriter, r *http.Request) {
 		b.mu.Lock()
@@ -180,6 +203,12 @@ func newBackend(t *testing.T) *backend {
 	})
 	b.srv = httptest.NewServer(mux)
 	t.Cleanup(b.srv.Close)
+	b.caDir = t.TempDir()
+	ca, err := gatewayca.LoadOrCreate(filepath.Join(b.caDir, "ca.key"), filepath.Join(b.caDir, "ca.pem"), filepath.Join(b.caDir, "records"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.ca = ca
 	return b
 }
 
@@ -191,7 +220,7 @@ func (b *backend) runner() *Runner {
 		GatewayDir: "/etc/flotilla-gateway", SidecarDir: "/etc/flotilla-sidecar", VMFlotillaDir: "flotilla",
 		GatewayUID: "10001", GatewayReadyTimeout: 2 * time.Second,
 	}
-	return New(cfg, keycloak.NewTokenSource(cfg.KeycloakBaseURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret))
+	return New(cfg, keycloak.NewTokenSource(cfg.KeycloakBaseURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret), b.ca, b.gate)
 }
 
 var target = SSHTarget{Host: "10.0.0.5", User: "azureuser", Port: "22", KeyPath: "/k/id", KnownHosts: "/k/kh"}
@@ -205,14 +234,27 @@ func TestSecureGateway(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SecureGateway: %v", err)
 	}
-	if cert.Serial != "ab" || cert.CAPEM != "CA" || cert.ContractID != "c1" {
+	if cert.Serial == "" || cert.CAPEM != string(b.ca.CAPEM()) || cert.ContractID != "c1" || cert.NotAfter != "2099-01-01T00:00:00Z" {
 		t.Fatalf("unexpected cert: %+v", cert)
 	}
-	if b.govAuth != "Bearer svc-token" {
-		t.Fatalf("gov Authorization = %q", b.govAuth)
+	if b.gate.gotCall != 1 || b.gate.gotSID != "s1" {
+		t.Fatalf("contract gate calls = %d (sid %q)", b.gate.gotCall, b.gate.gotSID)
 	}
-	if b.govBody["csr_pem"] != fakeCSR || b.govBody["server_ip"] != "20.1.2.3" || b.govBody["submission_id"] != "s1" {
-		t.Fatalf("gov body = %v", b.govBody)
+	block, _ := pem.Decode([]byte(cert.CertPEM))
+	if block == nil {
+		t.Fatal("no certificate PEM")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(b.ca.CAPEM())
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: pool, DNSName: "20.1.2.3", KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		t.Fatalf("issued certificate does not verify against the CA: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(b.caDir, "records", cert.Serial+".json")); err != nil {
+		t.Fatalf("issued certificate not recorded: %v", err)
 	}
 	ins := installs(t, dir)
 	for _, name := range []string{"tls.crt", "ca.crt", "parties.json"} {
@@ -225,7 +267,7 @@ func TestSecureGateway(t *testing.T) {
 		}
 	}
 	if !strings.Contains(ins["/etc/flotilla-gateway/tls.crt"].Content, "BEGIN CERTIFICATE") ||
-		ins["/etc/flotilla-gateway/ca.crt"].Content != "CA" {
+		ins["/etc/flotilla-gateway/ca.crt"].Content != string(b.ca.CAPEM()) {
 		t.Errorf("cert contents wrong")
 	}
 	var parties struct {
@@ -236,7 +278,7 @@ func TestSecureGateway(t *testing.T) {
 	if err := json.Unmarshal([]byte(ins["/etc/flotilla-gateway/parties.json"].Content), &parties); err != nil {
 		t.Fatal(err)
 	}
-	if parties.ContractID != "c1" || parties.ValidUntil != "2027-01-01T00:00:00Z" || len(parties.Parties) != 1 ||
+	if parties.ContractID != "c1" || parties.ValidUntil != "2099-01-01T00:00:00Z" || len(parties.Parties) != 1 ||
 		!strings.Contains(string(parties.Parties[0]), "prov-a") {
 		t.Errorf("parties.json = %+v", parties)
 	}
@@ -251,15 +293,27 @@ func TestSecureGateway(t *testing.T) {
 	}
 }
 
-func TestSecureGatewayGovConflict(t *testing.T) {
+func TestSecureGatewayContractRejected(t *testing.T) {
 	dir := setupFakeSSH(t)
 	b := newBackend(t)
-	b.govStatus = http.StatusConflict
-	if _, err := b.runner().SecureGateway(target, "20.1.2.3", "s1", noEmit); err == nil || !strings.Contains(err.Error(), "409") {
-		t.Fatalf("want 409 error, got %v", err)
+	notSigned := errors.New("contract is not signed")
+	b.gate.err = notSigned
+	if _, err := b.runner().SecureGateway(target, "20.1.2.3", "s1", noEmit); !errors.Is(err, notSigned) {
+		t.Fatalf("want the gate's error, got %v", err)
 	}
 	if ins := installs(t, dir); len(ins) != 0 {
-		t.Fatalf("files installed despite gov failure: %v", ins)
+		t.Fatalf("files installed despite the contract check failing: %v", ins)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(b.caDir, "records")); len(entries) != 0 {
+		t.Fatalf("certificate issued despite the contract check failing: %v", entries)
+	}
+}
+
+func TestSecureGatewayBadIP(t *testing.T) {
+	setupFakeSSH(t)
+	b := newBackend(t)
+	if _, err := b.runner().SecureGateway(target, "gateway.local", "s1", noEmit); err == nil || b.gate.gotCall != 0 {
+		t.Fatalf("want an IP error before the contract check, got %v (gate calls %d)", err, b.gate.gotCall)
 	}
 }
 

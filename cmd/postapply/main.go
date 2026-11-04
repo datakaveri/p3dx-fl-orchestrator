@@ -23,6 +23,7 @@ import (
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/flauto"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/govclient"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/httpapi"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/postapply"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/vmcred"
@@ -85,7 +86,13 @@ func main() {
 		cfg.SSHUser = *sshUser
 	}
 	tokens := keycloak.NewTokenSource(cfg.KeycloakBaseURL, cfg.KeycloakRealm, cfg.KeycloakClientID, cfg.KeycloakClientSecret)
-	run := postapply.New(cfg, tokens)
+	// The same gateway CA the server uses (same .env), so a gateway secured
+	// here is trusted by the orchestrator too.
+	ca, err := httpapi.LoadGatewayCA(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	run := postapply.New(cfg, tokens, ca, govclient.New(cfg.GovLayerURL, tokens.Token))
 	known, _ := os.MkdirTemp("", "postapply-")
 	defer os.RemoveAll(known)
 	target := postapply.SSHTarget{Host: *host, User: cfg.SSHUser, Port: cfg.SSHPort, KeyPath: *sshKey,

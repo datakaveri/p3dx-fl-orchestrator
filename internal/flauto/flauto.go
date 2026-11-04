@@ -47,7 +47,8 @@ type FLConfigSource interface {
 }
 
 // ContractPin names the one contract a session runs under: the contract
-// gov_layer issued the session gateway's certificate for (/gateway-certs).
+// the orchestrator's gateway CA issued the session gateway's certificate for
+// (postapply.SecureGateway).
 type ContractPin struct {
 	ProjectID  string
 	ContractID string
@@ -66,7 +67,7 @@ type submissionState struct {
 	expectedProviderCount int
 	ownerIP               string
 	tokens                map[string]struct{}
-	gatewayCA             *x509.CertPool // the session gateway's CA (gov_layer's governance CA)
+	gatewayCA             *x509.CertPool // the session gateway's CA (the orchestrator's gateway CA)
 	gatewayCAPEM          string
 	contract              ContractPin    // set with the gateway CA; the contract startSession reads
 	ownerReady            chan struct{}  // closed once ownerIP is set
@@ -147,7 +148,7 @@ func (m *Manager) gatewayRequest(method, url string, body []byte) (*http.Request
 	return req, nil
 }
 
-// SetGatewayCA records, from gov_layer's /gateway-certs response, the CA the
+// SetGatewayCA records, from the issued gateway certificate, the CA the
 // session gateway's certificate chains to and the contract it was issued
 // for; flauto will not talk to the gateway before it is set, and starts the
 // session only under that pinned contract.

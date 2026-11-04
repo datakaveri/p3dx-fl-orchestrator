@@ -7,10 +7,12 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -74,12 +76,15 @@ func mint(t *testing.T, claims jwt.MapClaims) string {
 
 func newTestServer(t *testing.T, key string) *Server {
 	kc := jwksServer(t)
+	caDir := t.TempDir()
 	cfg := &config.Config{
 		KeycloakBaseURL: kc.URL, KeycloakRealm: realm,
 		InternalServiceKey: key, FlotillaVMClientID: "flotilla-vm",
 		KeycloakClientID: "p3dx-fl-orchestrator", GatewayRESTPort: 12345,
 		ServiceRoot: t.TempDir(), TerraformDir: t.TempDir(), FLOutputStateDir: t.TempDir(),
-		VMCredentialClaimTTL: time.Hour, OwnerWaitTimeout: time.Second, GatewayReadyTimeout: time.Second,
+		GatewayCAKeyPath: filepath.Join(caDir, "ca.key"), GatewayCACertPath: filepath.Join(caDir, "ca.pem"),
+		GatewayCertRecordsDir: filepath.Join(caDir, "certs"),
+		VMCredentialClaimTTL:  time.Hour, OwnerWaitTimeout: time.Second, GatewayReadyTimeout: time.Second,
 	}
 	srv := New(cfg)
 	srv.gov = &stubGov{parties: map[string]*govclient.Parties{
@@ -439,5 +444,18 @@ func TestPrivateKeyOnlyForRunUser(t *testing.T) {
 	rec, out := do(t, h, http.MethodGet, "/p3dx/vm-provisioning/private-key?token="+tok, userAuth(t, "bob"), nil)
 	if rec.Code != http.StatusNotFound || out["error"] != "NOT_FOUND_OR_ALREADY_DOWNLOADED" {
 		t.Fatalf("other user: %d %v", rec.Code, out)
+	}
+}
+
+func TestGatewayCACertPublic(t *testing.T) {
+	srv := newTestServer(t, "k")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/p3dx/gateway-ca-cert", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/x-pem-file" ||
+		!bytes.Equal(rec.Body.Bytes(), srv.ca.CAPEM()) {
+		t.Fatalf("got %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	if block, _ := pem.Decode(rec.Body.Bytes()); block == nil || block.Type != "CERTIFICATE" {
+		t.Fatal("body is not a PEM certificate")
 	}
 }

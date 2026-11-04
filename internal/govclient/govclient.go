@@ -1,6 +1,7 @@
 // Package govclient reads what the orchestrator needs from gov_layer's
 // contract API, authenticated with the orchestrator's Keycloak
-// service-account token (the same token /gateway-certs and /fl-output take).
+// service-account token (the same token /fl-output takes), including the
+// contract check behind every gateway certificate (GatewayAuthorization).
 package govclient
 
 import (
@@ -13,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/gatewayca"
 )
 
 // TokenFunc returns the orchestrator's service-account access token
@@ -76,6 +79,16 @@ func (p *Parties) IsDataProvider(username string) bool {
 type contractBody struct {
 	Status   string `json:"status"`
 	Contract *struct {
+		ContractID  string `json:"contract_id"`
+		ProjectID   string `json:"project_id"`
+		JobID       string `json:"job_id"`
+		Technique   string `json:"technique"`
+		SessionInfo struct {
+			SessionID string `json:"session_id"`
+		} `json:"session_info"`
+		Lifecycle struct {
+			ValidUntil time.Time `json:"valid_until"`
+		} `json:"lifecycle"`
 		Parties struct {
 			User struct {
 				ID   string `json:"id"`
@@ -190,4 +203,88 @@ func (c *Client) ContractByProject(ctx context.Context, projectID string) (*Cont
 		return nil, fmt.Errorf("gov_layer contract: unexpected response (status %q)", body.Status)
 	}
 	return body.Contract, nil
+}
+
+// Errors GatewayAuthorization wraps when gov_layer does not vouch for a
+// session's contract.
+var (
+	ErrContractNotFL     = errors.New("contract is not an FL contract")
+	ErrContractNotSigned = errors.New("contract is not signed by the governance layer and every data provider")
+	ErrContractExpired   = errors.New("contract has expired")
+)
+
+// GatewayAuthorization is the check behind every gateway certificate the
+// orchestrator's CA issues. It loads the submission's latest contract
+// (GET /contract/{submissionID}) and asks gov_layer whether that exact
+// contract is fully signed (GET /contracts/{contractID}/signatures, which
+// re-verifies every signature and also checks the contract is final and no
+// provider's consent has expired). The contract must also be an FL contract
+// that has not reached its valid_until. A missing contract wraps
+// ErrNoContract.
+func (c *Client) GatewayAuthorization(ctx context.Context, submissionID string, now time.Time) (*gatewayca.Authorization, error) {
+	body, err := c.fetchContract(ctx, submissionID)
+	if err != nil {
+		return nil, err
+	}
+	k := body.Contract
+	if k.ContractID == "" {
+		return nil, fmt.Errorf("gov_layer contract for submission %s has no contract_id", submissionID)
+	}
+	if k.Technique != "FL" {
+		return nil, fmt.Errorf("%w (contract %s, technique %q)", ErrContractNotFL, k.ContractID, k.Technique)
+	}
+	matching, err := c.signaturesMatch(ctx, k.ContractID)
+	if err != nil {
+		return nil, err
+	}
+	if !matching {
+		return nil, fmt.Errorf("%w (contract %s)", ErrContractNotSigned, k.ContractID)
+	}
+	if !now.Before(k.Lifecycle.ValidUntil) {
+		return nil, fmt.Errorf("%w (contract %s expired at %s)", ErrContractExpired, k.ContractID,
+			k.Lifecycle.ValidUntil.UTC().Format(time.RFC3339))
+	}
+	a := &gatewayca.Authorization{
+		ContractID: k.ContractID, ProjectID: k.ProjectID, JobID: k.JobID,
+		SubmissionID: k.SessionInfo.SessionID, ValidUntil: k.Lifecycle.ValidUntil,
+		Parties: make([]gatewayca.Party, 0, len(k.Parties.DataProviders)),
+	}
+	if a.SubmissionID == "" {
+		a.SubmissionID = submissionID
+	}
+	for _, p := range k.Parties.DataProviders {
+		a.Parties = append(a.Parties, gatewayca.Party{ID: p.ID, Name: p.Name})
+	}
+	return a, nil
+}
+
+// signaturesMatch reports gov_layer's GET /contracts/{contractID}/signatures
+// verdict: true only for {"signatures": "matching"}.
+func (c *Client) signaturesMatch(ctx context.Context, contractID string) (bool, error) {
+	tok, err := c.token()
+	if err != nil {
+		return false, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/contracts/"+url.PathEscape(contractID)+"/signatures", nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("gov_layer contract signatures: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("gov_layer contract signatures returned %d", resp.StatusCode)
+	}
+	var body struct {
+		Signatures string `json:"signatures"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return false, fmt.Errorf("gov_layer contract signatures: %w", err)
+	}
+	return body.Signatures == "matching", nil
 }

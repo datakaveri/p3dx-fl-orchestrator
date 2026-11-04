@@ -53,8 +53,9 @@ type Config struct {
 	// --- Flotilla join gateway ---
 
 	// The orchestrator's own Keycloak identity (client-credentials grant,
-	// realm role fl-orchestrator): used to request gateway certificates from
-	// gov_layer, to call the gateway's REST API, and for controlplane callbacks.
+	// realm role fl-orchestrator): used to check contracts with gov_layer
+	// before issuing gateway certificates, to call the gateway's REST API, and
+	// for controlplane callbacks.
 	KeycloakClientID     string // KEYCLOAK_CLIENT_ID (default p3dx-fl-orchestrator)
 	KeycloakClientSecret string // KEYCLOAK_CLIENT_SECRET
 	// FlotillaVMClientID is the Keycloak client VM credentials are minted
@@ -73,6 +74,14 @@ type Config struct {
 	GatewayRESTPort int    // GATEWAY_REST_PORT (default 12345)
 	SSHUser         string // VM_SSH_USER (default azureuser — participant-vm's admin_username)
 	SSHPort         string // VM_SSH_PORT (default 22)
+
+	// The orchestrator is the CA for Flotilla join gateways (gatewayca): its
+	// own RSA key and self-signed certificate, generated on first start, sign
+	// each FL session gateway's TLS certificate. Every issued certificate is
+	// recorded as <GatewayCertRecordsDir>/<serial>.json.
+	GatewayCAKeyPath      string // GATEWAY_CA_KEY_PATH (default <ServiceRoot>/state/gateway-ca/ca.key)
+	GatewayCACertPath     string // GATEWAY_CA_CERT_PATH (default <ServiceRoot>/state/gateway-ca/ca.pem)
+	GatewayCertRecordsDir string // GATEWAY_CERT_RECORDS_DIR (default <ServiceRoot>/state/gateway-ca/certs)
 
 	// FLOutputStateDir (FL_OUTPUT_STATE_DIR, default <ServiceRoot>/state/fl-owner)
 	// keeps each submission's output-owner (server) VM SSH key, known_hosts
@@ -148,6 +157,10 @@ func Load() *Config {
 		GatewayRESTPort: getEnvInt("GATEWAY_REST_PORT", 12345),
 		SSHUser:         getEnv("VM_SSH_USER", "azureuser"),
 		SSHPort:         getEnv("VM_SSH_PORT", "22"),
+
+		GatewayCAKeyPath:      getEnv("GATEWAY_CA_KEY_PATH", filepath.Join(root, "state", "gateway-ca", "ca.key")),
+		GatewayCACertPath:     getEnv("GATEWAY_CA_CERT_PATH", filepath.Join(root, "state", "gateway-ca", "ca.pem")),
+		GatewayCertRecordsDir: getEnv("GATEWAY_CERT_RECORDS_DIR", filepath.Join(root, "state", "gateway-ca", "certs")),
 
 		FLOutputStateDir: getEnv("FL_OUTPUT_STATE_DIR", filepath.Join(root, "state", "fl-owner")),
 		VMRegistryToken:  os.Getenv("VM_REGISTRY_TOKEN"),

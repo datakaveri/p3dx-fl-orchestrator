@@ -2,45 +2,59 @@ package postapply
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/config"
+	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/gatewayca"
 	"github.com/s4r4v4n04/p3dx-fl-orchestrator/internal/keycloak"
 )
 
 // Emit reports one provisioning step (the same events the SSE stream shows).
 type Emit func(step, status, message string)
 
+// ContractGate is gov_layer's say on whether a session's contract may get a
+// gateway certificate (*govclient.Client); a stub in tests.
+type ContractGate interface {
+	GatewayAuthorization(ctx context.Context, submissionID string, now time.Time) (*gatewayca.Authorization, error)
+}
+
 // Runner holds what the post-apply steps need.
 type Runner struct {
 	cfg    *config.Config
 	tokens *keycloak.TokenSource
 	http   *http.Client
+	ca     *gatewayca.CA
+	gate   ContractGate
 }
 
-func New(cfg *config.Config, tokens *keycloak.TokenSource) *Runner {
-	return &Runner{cfg: cfg, tokens: tokens, http: &http.Client{Timeout: 30 * time.Second}}
+// New builds a Runner. ca signs gateway certificates, for contracts gate
+// confirms.
+func New(cfg *config.Config, tokens *keycloak.TokenSource, ca *gatewayca.CA, gate ContractGate) *Runner {
+	return &Runner{cfg: cfg, tokens: tokens, http: &http.Client{Timeout: 30 * time.Second}, ca: ca, gate: gate}
 }
 
-// GatewayCert is gov_layer's POST /gateway-certs response (the parts we use).
+// GatewayCert is a gateway certificate issued by the orchestrator's CA, with
+// the contract it was issued for.
 type GatewayCert struct {
-	Serial       string            `json:"serial"`
-	CertPEM      string            `json:"certificate_pem"`
-	CAPEM        string            `json:"ca_certificate_pem"`
-	Fingerprint  string            `json:"fingerprint_sha256"`
-	NotAfter     string            `json:"not_after"`
-	ContractID   string            `json:"contract_id"`
-	ProjectID    string            `json:"project_id"`
-	JobID        string            `json:"job_id"`
-	SubmissionID string            `json:"submission_id"`
-	ValidUntil   string            `json:"valid_until"`
-	Parties      []json.RawMessage `json:"parties"`
+	Serial       string
+	CertPEM      string
+	CAPEM        string
+	Fingerprint  string
+	NotAfter     string // RFC 3339
+	ContractID   string
+	ProjectID    string
+	JobID        string
+	SubmissionID string
+	ValidUntil   string // RFC 3339
+	Parties      []gatewayca.Party
 }
 
 // serviceCall POSTs JSON to url with the orchestrator's service token.
@@ -93,11 +107,29 @@ func (r *Runner) SecureGateway(t SSHTarget, serverIP, submissionID string, emit 
 		return nil, fmt.Errorf("read gateway CSR: %v", err)
 	}
 
-	emit("Securing gateway", "running", "Requesting the gateway certificate from the governance layer")
-	var cert GatewayCert
-	if err := r.serviceCall(r.cfg.GovLayerURL+"/gateway-certs",
-		map[string]string{"csr_pem": csr, "server_ip": serverIP, "submission_id": submissionID}, &cert); err != nil {
+	emit("Securing gateway", "running", "Checking the contract with the governance layer")
+	ip := net.ParseIP(strings.TrimSpace(serverIP))
+	if ip == nil {
+		return nil, fmt.Errorf("gateway certificate: server IP %q is not an IP address", serverIP)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	auth, err := r.gate.GatewayAuthorization(ctx, submissionID, time.Now())
+	if err != nil {
 		return nil, fmt.Errorf("gateway certificate: %w", err)
+	}
+
+	emit("Securing gateway", "running", "Issuing the gateway certificate")
+	issued, err := r.ca.Issue(csr, ip, *auth, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("gateway certificate: %w", err)
+	}
+	cert := GatewayCert{
+		Serial: issued.Serial, CertPEM: string(issued.CertPEM), CAPEM: string(r.ca.CAPEM()),
+		Fingerprint: issued.FingerprintSHA256, NotAfter: issued.NotAfter.UTC().Format(time.RFC3339),
+		ContractID: auth.ContractID, ProjectID: auth.ProjectID, JobID: auth.JobID,
+		SubmissionID: auth.SubmissionID, ValidUntil: auth.ValidUntil.UTC().Format(time.RFC3339),
+		Parties: auth.Parties,
 	}
 
 	parties, _ := json.MarshalIndent(map[string]any{

@@ -16,7 +16,7 @@ const expirySkew = 30 * time.Second
 // TokenSource hands out this service's own Keycloak access token
 // (client-credentials grant), cached until shortly before it expires —
 // same pattern as p3dx_gov_layer/internal/keycloak/keycloak.go. It is what
-// gov_layer (/gateway-certs), the controlplane (VM-credential callbacks) and the
+// gov_layer (contract reads, /fl-output), the controlplane (VM-credential callbacks) and the
 // session gateways' REST API accept from the orchestrator.
 type TokenSource struct {
 	tokenURL, clientID, secret string
