@@ -258,7 +258,7 @@ func TestCollectOutputUploadsLatestModelAndMetrics(t *testing.T) {
 
 	// Live state: owner VM registered, CA known, a panel watching.
 	runTok := m.store.CreateToken("owner", "user")
-	if err := m.SetGatewayCA("sub/1", gw.caPEM()); err != nil {
+	if err := m.SetGatewayCA("sub/1", gw.caPEM(), testPin); err != nil {
 		t.Fatal(err)
 	}
 	m.RegisterOwnerVM("sub/1", "127.0.0.1", runTok)
@@ -376,7 +376,7 @@ func TestCollectOutputNoSavedKey(t *testing.T) {
 	gov := newGovFake(t)
 	m := NewManager(vmsession.NewStore(), staticToken("svc-token"), gw.port)
 	m.ConfigureOutput(OutputConfig{GovLayerURL: gov.srv.URL + "/api/v1", StateDir: t.TempDir()})
-	_ = m.SetGatewayCA("sub-1", gw.caPEM())
+	_ = m.SetGatewayCA("sub-1", gw.caPEM(), testPin)
 	m.RegisterOwnerVM("sub-1", "127.0.0.1", "")
 	err := m.collectOutput("sub-1")
 	if err == nil || !strings.Contains(err.Error(), "no saved SSH key") {

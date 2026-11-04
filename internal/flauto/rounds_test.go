@@ -69,7 +69,7 @@ func TestLatestRoundReadsOnlyHeaders(t *testing.T) {
 	model := &bigModel{total: 256 << 20, served: make(chan struct{}, 1)}
 	g.latestGM = model.handler("12")
 	m := NewManager(vmsession.NewStore(), staticToken("svc-token"), g.port)
-	_ = m.SetGatewayCA("sub-1", g.caPEM())
+	_ = m.SetGatewayCA("sub-1", g.caPEM(), testPin)
 	s := m.getOrCreate("sub-1")
 
 	n, ok := m.latestRound(context.Background(), m.client(s, 10*time.Second), "127.0.0.1", "sub_1")
@@ -106,7 +106,7 @@ func TestLatestRoundNoRoundYet(t *testing.T) {
 			g := newGateway(t)
 			g.latestGM = h
 			m := NewManager(vmsession.NewStore(), staticToken("svc-token"), g.port)
-			_ = m.SetGatewayCA("sub-1", g.caPEM())
+			_ = m.SetGatewayCA("sub-1", g.caPEM(), testPin)
 			if n, ok := m.latestRound(context.Background(), m.client(m.getOrCreate("sub-1"), 5*time.Second), "127.0.0.1", "sub_1"); ok {
 				t.Fatalf("got round %d for %s", n, name)
 			}
@@ -143,7 +143,7 @@ func TestRoundPollerDuringSession(t *testing.T) {
 	m := NewManager(store, staticToken("svc-token"), g.port)
 	m.roundPollInterval = 20 * time.Millisecond
 	m.SetFLConfigSource(&stubFLConfig{fl: &govclient.FLRunConfig{NumRounds: 3, LocalEpochs: 1, LearningRate: 0.001, BatchSize: 8}})
-	_ = m.SetGatewayCA("sub-1", g.caPEM())
+	_ = m.SetGatewayCA("sub-1", g.caPEM(), testPin)
 	m.RegisterOwnerVM("sub-1", "127.0.0.1", runTok)
 	m.startSession("sub-1", m.getOrCreate("sub-1"))
 

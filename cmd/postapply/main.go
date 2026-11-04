@@ -32,12 +32,13 @@ import (
 // followSession runs the real flauto against the secured gateway: poll
 // /client_status over HTTPS with the service token until -expect clients
 // are connected, start the session, and print flauto's events until done.
-func followSession(cfg *config.Config, tokens *keycloak.TokenSource, submission, ip, caPEM string, expect int, wait time.Duration) {
+func followSession(cfg *config.Config, tokens *keycloak.TokenSource, submission, ip string, cert *postapply.GatewayCert, expect int, wait time.Duration) {
 	store := vmsession.NewStore()
 	flow := flauto.NewManager(store, tokens.Token, cfg.GatewayRESTPort)
 	flow.SetFLConfigSource(govclient.New(cfg.GovLayerURL, tokens.Token))
 	runToken := store.CreateToken("postapply", "user")
-	if err := flow.SetGatewayCA(submission, caPEM); err != nil {
+	if err := flow.SetGatewayCA(submission, cert.CAPEM,
+		flauto.ContractPin{ProjectID: cert.ProjectID, ContractID: cert.ContractID}); err != nil {
 		log.Fatal(err)
 	}
 	flow.RegisterOwnerVM(submission, ip, runToken)
@@ -104,7 +105,7 @@ func main() {
 		}
 		log.Printf("gateway secured: serial %s, contract %s, not after %s", cert.Serial, cert.ContractID, cert.NotAfter)
 		if *startSession {
-			followSession(cfg, tokens, *submission, *publicIP, cert.CAPEM, *expect, *sessionWait)
+			followSession(cfg, tokens, *submission, *publicIP, cert, *expect, *sessionWait)
 		}
 
 	case "data-provider":
