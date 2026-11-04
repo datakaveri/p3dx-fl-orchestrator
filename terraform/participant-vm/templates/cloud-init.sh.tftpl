@@ -126,6 +126,7 @@ services:
       - "12345:12345"
     environment:
       GATEWAY_MODE: server
+      CLIENT_ROLES: "${gateway_client_roles}"
       KEYCLOAK_ISSUER: "${keycloak_issuer}"
       KEYCLOAK_JWKS_URL: "${keycloak_jwks_url != "" ? keycloak_jwks_url : "${keycloak_issuer}/protocol/openid-connect/certs"}"
       UPSTREAM_GRPC: flotilla-gw-server:50051

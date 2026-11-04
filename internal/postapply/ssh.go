@@ -31,7 +31,8 @@ type SSHTarget struct {
 }
 
 func (t SSHTarget) args(remote string) []string {
-	a := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "StrictHostKeyChecking=accept-new"}
+	a := append([]string{"-o", "BatchMode=yes"}, connectOptions...)
+	a = append(a, "-o", "StrictHostKeyChecking=accept-new")
 	if t.KnownHosts != "" {
 		a = append(a, "-o", "UserKnownHostsFile="+t.KnownHosts)
 	}
@@ -43,6 +44,13 @@ func (t SSHTarget) args(remote string) []string {
 	}
 	return append(a, t.User+"@"+t.Host, remote)
 }
+
+// connectOptions bound every ssh the orchestrator runs: an unreachable VM
+// fails after ConnectTimeout instead of the TCP default (~2 min), and a VM
+// that stops answering mid-command is dropped after ~1 min of missed
+// keepalives instead of hanging the run. Keep in sync with the ssh in
+// terraform/participant-vm/dry-run/main.tf.
+var connectOptions = []string{"-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"}
 
 // sshBinary is overridable in tests.
 var sshBinary = "ssh"

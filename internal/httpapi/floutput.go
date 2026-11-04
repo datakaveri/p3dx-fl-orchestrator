@@ -18,6 +18,14 @@ func (s *Server) postCollectFLOutput(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, j{"status": "FAILED", "error": "INVALID_SUBMISSION_ID"})
 		return
 	}
+	parties := s.sessionParties(w, r, id)
+	if parties == nil {
+		return
+	}
+	if !parties.IsOwner(usernameFromCtx(r)) {
+		writeJSON(w, http.StatusForbidden, j{"status": "FAILED", "error": "NOT_SESSION_OWNER"})
+		return
+	}
 	if !s.flow.StartCollectOutput(id) {
 		writeJSON(w, http.StatusAccepted, j{"status": "already_collecting"})
 		return
